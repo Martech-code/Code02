@@ -148,103 +148,6 @@ class ChromeInstance:
         except:
             return False
 
-    def scroll_and_collect_groups(self):
-        print(f"[Worker {self.worker_id}] Bắt đầu scroll và thu thập URLs...")
-        group_links = set()
-        no_new_content_count = 0
-        previous_content_length = 0
-        last_height = self.driver.execute_script("return document.documentElement.scrollHeight")
-        
-        while True:
-            # Scroll xuống
-            current_height = self.driver.execute_script("return window.pageYOffset")
-            target_height = min(current_height + 300, last_height)
-            self.driver.execute_script(f"window.scrollTo(0, {target_height});")
-            time.sleep(0.3)
-
-            # Đợi để trang load thêm nội dung
-            time.sleep(SCROLL_PAUSE_TIME)
-            
-            # Kiểm tra vị trí scroll hiện tại
-            actual_height = self.driver.execute_script("return window.pageYOffset")
-            if abs(actual_height - target_height) > 50:  # Nếu vị trí scroll bị nhảy
-                self.driver.execute_script(f"window.scrollTo(0, {target_height});")
-                time.sleep(0.3)
-
-            # Thu thập URLs
-            elements = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='/groups/']")
-            current_content_length = len(elements)
-            
-            print(f"[Worker {self.worker_id}] Đã tìm thấy {current_content_length} nhóm...")
-            
-            for element in elements:
-                try:
-                    href = element.get_attribute('href')
-                    if href and re.search(r'facebook\.com/groups/\d+/?$', href):
-                        clean_url = re.sub(r'\?.*$', '', href)
-                        if clean_url not in self.processed_groups:
-                            group_links.add(clean_url)
-                except:
-                    continue
-
-            # Kiểm tra xem có nội dung mới không
-            if current_content_length == previous_content_length:
-                no_new_content_count += 1
-                print(f"[Worker {self.worker_id}] Không tìm thấy nội dung mới... ({no_new_content_count}/8)")
-                if no_new_content_count >= 8:
-                    print(f"[Worker {self.worker_id}] Hoàn tất thu thập URLs sau 8 lần không có nội dung mới")
-                    break
-            else:
-                no_new_content_count = 0
-                previous_content_length = current_content_length
-
-            # Cập nhật chiều cao trang mới
-            new_height = self.driver.execute_script("return document.documentElement.scrollHeight")
-            if new_height != last_height:
-                last_height = new_height
-                no_new_content_count = 0
-            elif abs(actual_height - last_height) < 100:
-                time.sleep(SCROLL_PAUSE_TIME * 2)
-                if abs(actual_height - self.driver.execute_script("return document.documentElement.scrollHeight")) < 100:
-                    print(f"[Worker {self.worker_id}] Đã đến cuối trang")
-                    break
-
-        print(f"[Worker {self.worker_id}] Tổng cộng đã thu thập được {len(group_links)} URLs độc nhất")
-        return list(group_links)
-
-def save_group_urls(urls, keyword, output_dir, worker_id):
-    file_path = os.path.join(output_dir, f'collected_urls_worker_{worker_id}.json')
-    data = {
-        'keyword': keyword,
-        'timestamp': datetime.now().isoformat(),
-        'urls': urls
-    }
-
-    try:
-        if os.path.exists(file_path):
-            with open(file_path, 'r', encoding='utf-8') as f:
-                existing_data = json.load(f)
-                if not isinstance(existing_data, list):
-                    existing_data = [existing_data]
-        else:
-            existing_data = []
-            
-        existing_data.append(data)
-        
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(existing_data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Error saving URLs to JSON: {str(e)}")
-
-def save_failed_urls(failed_urls, output_dir, worker_id):
-    file_path = os.path.join(output_dir, f'failed_urls_worker_{worker_id}.json')
-    try:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(failed_urls, f, ensure_ascii=False, indent=2)
-        print(f"[Worker {worker_id}] Đã lưu {len(failed_urls)} URLs thất bại vào file")
-    except Exception as e:
-        print(f"Error saving failed URLs: {str(e)}")
-
 def convert_members_count(count_text):
     try:
         # Remove "thành viên", "members" text
@@ -492,77 +395,7 @@ def worker_process(chrome_instance: ChromeInstance, keywords: List[str], process
                 selected_keywords = random.sample(keywords, 2)
                 search_keywords = ' '.join(selected_keywords)
 
-            if search_keywords in processed_items:
-                continue
-
-            try:
-                encoded_keywords = '%20'.join(search_keywords.split())
-                search_url = f"https://www.facebook.com/groups/search/groups?q={encoded_keywords}&filters=eyJwdWJsaWNfZ3JvdXBzOjAiOiJ7XCJuYW1lXCI6XCJwdWJsaWNfZ3JvdXBzXCIsXCJhcmdzXCI6XCJcIn0ifQ%3D%3D"
-
-                print(f"\n[Worker {chrome_instance.worker_id}] Tìm kiếm với từ khóa: {search_keywords}")
-                driver.get(search_url)
-                time.sleep(random.uniform(2, 3))
-
-                group_urls = chrome_instance.scroll_and_collect_groups()
-                if not group_urls:
-                    print(f"[Worker {chrome_instance.worker_id}] Không tìm thấy URLs cho từ khóa: {search_keywords}")
-                    continue
-
-                save_group_urls(group_urls, search_keywords, output_dir, chrome_instance.worker_id)
-
-                total_urls = len(group_urls)
-                processed_urls = 0
-                failed_urls = 0
-
-                print(f"[Worker {chrome_instance.worker_id}] Bắt đầu xử lý {total_urls} nhóm...")
-                
-                for idx, group_url in enumerate(group_urls, 1):
-                    if group_url in processed_groups:
-                        processed_urls += 1
-                        continue
-
-                    print(f"[Worker {chrome_instance.worker_id}] Đang xử lý nhóm {idx}/{total_urls}")
-                    
-                    # Lưu tiến độ trước khi xử lý mỗi URL
-                    chrome_instance.save_progress(
-                        search_keywords,
-                        group_urls,
-                        idx - 1,
-                        output_dir
-                    )
-                    
-                    if process_single_group(chrome_instance, group_url, search_keywords, output_file, lock):
-                        with lock:
-                            processed_groups.add(group_url)
-                            chrome_instance.processed_groups.add(group_url)
-                        processed_urls += 1
-                    else:
-                        failed_urls += 1
-
-                    time.sleep(random.uniform(MIN_DELAY_BETWEEN_REQUESTS, MAX_DELAY_BETWEEN_REQUESTS))
-
-                # Xóa file tiến độ sau khi hoàn thành keyword
-                chrome_instance.clear_progress(output_dir)
-
-                print(f"[Worker {chrome_instance.worker_id}] Kết quả xử lý keyword '{search_keywords}':")
-                print(f"- Tổng số URLs: {total_urls}")
-                print(f"- Đã xử lý: {processed_urls}")
-                print(f"- Thất bại: {failed_urls}")
-
-                chrome_instance.processed_count += 1
-                with lock:
-                    processed_items.add(search_keywords)
-                    if chrome_instance.processed_count % 10 == 0:
-                        save_progress(processed_items, processed_groups, output_dir)
-
-            except Exception as e:
-                print(f"[Worker {chrome_instance.worker_id}] Lỗi xử lý từ khóa {search_keywords}: {str(e)}")
-                retry_count += 1
-                if retry_count >= MAX_RETRIES:
-                    print(f"[Worker {chrome_instance.worker_id}] Đã vượt quá số lần thử lại cho phép")
-                    break
-                time.sleep(random.uniform(2, 4))
-
+            
     except Exception as e:
         print(f"[Worker {chrome_instance.worker_id}] Lỗi: {str(e)}")
     finally:
@@ -591,8 +424,8 @@ def save_progress(processed_items, processed_groups, output_dir):
         }, f)
 
 def main():
-    input_file = r'C:\Users\Admin\Downloads\Tìm Group Công Khai\Keyword.txt'
-    output_dir = r'C:\Users\Admin\Downloads\Tìm Group Công Khai\output'
+    input_file = r'C:\Users\Admin\Downloads\group_info_recheck\group_info_recheck.txt'
+    output_dir = r'C:\Users\Admin\Downloads\group_info_recheck\output'
 
     os.makedirs(output_dir, exist_ok=True)
 
