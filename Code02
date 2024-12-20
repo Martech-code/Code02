@@ -17,7 +17,7 @@ from urllib.parse import quote
 
 class FacebookAdsLibrary:
     def __init__(self):
-        self.chrome_options = uc.ChromeOptions()  # Sử dụng undetected_chromedriver
+        self.chrome_options = uc.ChromeOptions()
         
         # Thêm các user agent ngẫu nhiên
         user_agents = [
@@ -30,10 +30,8 @@ class FacebookAdsLibrary:
         # Thêm các tham số stealth
         self.chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         self.chrome_options.add_argument('--disable-extensions')
-        self.chrome_options.add_experimental_option('useAutomationExtension', False)
-        self.chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         
-        # Thêm các preference để tránh detection
+        # Thay đổi cách set experimental options
         prefs = {
             "credentials_enable_service": False,
             "profile.password_manager_enabled": False,
@@ -44,7 +42,10 @@ class FacebookAdsLibrary:
         }
         self.chrome_options.add_experimental_option("prefs", prefs)
         
-        self.chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9242")
+        # Thay đổi cách loại bỏ các switch
+        self.chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+        self.chrome_options.add_experimental_option('useAutomationExtension', False)
+        
         self.chrome_options.add_argument('--disable-gpu')
         self.chrome_options.add_argument('--no-sandbox')
         self.chrome_options.add_argument('--disable-dev-shm-usage')
@@ -52,12 +53,20 @@ class FacebookAdsLibrary:
         self.chrome_options.add_argument('--disk-cache-size=1')
         self.chrome_options.add_argument('--media-cache-size=1')
         self.chrome_options.add_argument('--disable-applications-cache')
+        
+        # Khởi tạo service và driver
         self.service = Service()
         try:
             self.driver = uc.Chrome(options=self.chrome_options)
-        except:
-            self.service = Service()
-            self.driver = webdriver.Chrome(service=self.service, options=self.chrome_options)
+        except Exception as e:
+            print(f"Failed to initialize undetected-chromedriver: {e}")
+            print("Falling back to regular Chrome WebDriver...")
+            try:
+                self.driver = webdriver.Chrome(service=self.service, options=self.chrome_options)
+            except Exception as e:
+                print(f"Failed to initialize regular Chrome WebDriver: {e}")
+                raise
+                
         self.tracking_file = os.path.join("Downloads", "Ads Library Analysis", "tracking.json")
         self.tracking_data = self.load_tracking_data()
         self.current_keyword = None
@@ -621,20 +630,28 @@ class FacebookAdsLibrary:
 
 def main():
     print("Starting Facebook Ads Library Scraper...")
-    os.makedirs(os.path.join("Downloads", "Ads Library Analysis"), exist_ok=True)
-    print("Created necessary directories")
-
-    scraper = FacebookAdsLibrary()
-    print("Initialized scraper")
-
-    if not scraper.setup_driver():
-        print("Failed to setup driver. Exiting...")
+    try:
+        os.makedirs(os.path.join("Downloads", "Ads Library Analysis"), exist_ok=True)
+        print("Created necessary directories")
+    except Exception as e:
+        print(f"Error creating directories: {e}")
         return
 
+    scraper = None
     try:
+        scraper = FacebookAdsLibrary()
+        print("Initialized scraper")
+
+        if not scraper.setup_driver():
+            print("Failed to setup driver. Exiting...")
+            return
+
         scraper.process_keyword_files()
+    except Exception as e:
+        print(f"Error in main execution: {e}")
     finally:
-        scraper.close()
+        if scraper:
+            scraper.close()
 
 if __name__ == "__main__":
     main()
