@@ -36,44 +36,36 @@ class KeywordProcessor:
         self.keywords_queue = keywords_queue
         self.output_path = output_path
         self.lock = threading.Lock()
-        self.instance_stats = {}  # Track stats cho mỗi instance
 
     def process_keywords(self, port):
         scraper = FacebookAdsLibrary(port)
-        self.instance_stats[port] = {
-            'keywords_processed': 0,
-            'records_processed': 0,
-            'start_time': time.time()
-        }
-        
+        if not scraper.setup_driver():
+            print(f"Failed to setup driver for port {port}. Exiting...")
+            return
+
         try:
             while True:
-                with self.lock:
-                    if self.keywords_queue.empty():
-                        break
-                    keyword = self.keywords_queue.get()
-                
-                print(f"Port {port} stats:")
-                print(f"Keywords processed: {self.instance_stats[port]['keywords_processed']}")
-                print(f"Records processed: {self.instance_stats[port]['records_processed']}")
-                
-                scraper.process_keyword(keyword, self.output_path)
-                
-                self.instance_stats[port]['keywords_processed'] += 1
-                
-        except Exception as e:
-            print(f"Port {port} error: {e}")
+                try:
+                    with self.lock:
+                        if self.keywords_queue.empty():
+                            break
+                        keyword = self.keywords_queue.get()
+                    
+                    print(f"Port {port} processing keyword: {keyword}")
+                    scraper.process_keyword(keyword, self.output_path)
+                    
+                except queue.Empty:
+                    break
+                except Exception as e:
+                    print(f"Error processing keyword on port {port}: {e}")
+                    continue
         finally:
-            runtime = time.time() - self.instance_stats[port]['start_time']
-            print(f"Port {port} finished. Total runtime: {runtime:.2f}s")
+            scraper.close()
 
 class FacebookAdsLibrary:
     def __init__(self, port):
-        self.port = port
         self.chrome_options = Options()
         self.chrome_options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-        self.instance_tracking = {}
-        self.file_lock = threading.Lock()
         self.chrome_options.add_argument('--disable-gpu')
         self.chrome_options.add_argument('--no-sandbox')
         self.chrome_options.add_argument('--disable-dev-shm-usage')
@@ -114,25 +106,29 @@ class FacebookAdsLibrary:
     def flush_buffer_to_excel(self, output_path):
         if not self.temp_data_buffer:
             return
-            
-        with self.file_lock:  # Sử dụng lock riêng cho file operations
-            try:
-                df = pd.DataFrame(self.temp_data_buffer)
-                if os.path.exists(output_path):
-                    with pd.ExcelWriter(output_path, mode='a', engine='openpyxl', 
-                                      if_sheet_exists='overlay') as writer:
-                        start_row = writer.sheets['Sheet1'].max_row
-                        df.to_excel(writer, index=False, header=False, startrow=start_row)
-                else:
-                    df.to_excel(output_path, index=False)
-                self.temp_data_buffer = []
-                print(f"Port {self.port}: Successfully flushed {len(df)} records")
-            except Exception as e:
-                print(f"Port {self.port}: Error flushing buffer: {e}")
+
+        print(f"Flushing {len(self.temp_data_buffer)} records to Excel...")
+        columns = [
+            'keyword', 'library_id', 'runtime', 'page_name', 'ad_status',
+            'ads_using_content', 'content', 'Button_CTA', 'Link_CTA', 'has_video', 'video_url'
+        ]
+
+        new_df = pd.DataFrame(self.temp_data_buffer)
+        
+        if os.path.exists(output_path):
+            with pd.ExcelWriter(output_path, mode='a', engine='openpyxl', if_sheet_exists='overlay') as writer:
+                start_row = writer.sheets['Sheet1'].max_row
+                new_df.to_excel(writer, index=False, header=False, startrow=start_row)
+        else:
+            new_df = new_df[columns]
+            new_df.to_excel(output_path, index=False)
+
+        self.temp_data_buffer = []
+        print("Buffer flushed successfully")
     
     def simulate_human_scroll(self, start_y, end_y, duration=1.0):
         """Mô phỏng cuộn chuột tự nhiên của người dùng với khoảng cách scroll từ 200-800px."""
-        print(f"Port {self.port}: Scrolling from {start_y} to {end_y}")
+        print(f"Simulating human scroll from {start_y} to {end_y}")
         
         # Tính toán khoảng cách scroll thực tế (random từ 200-800px)
         scroll_distance = random.uniform(200, 800)
@@ -145,19 +141,16 @@ class FacebookAdsLibrary:
         
         current_y = start_y
         for _ in range(steps):
-            try:
-                # Thêm một chút ngẫu nhiên vào mỗi bước cuộn
-                random_offset = random.uniform(-1, 1)
-                current_y += step_y + random_offset
-                
-                # Đảm bảo không scroll quá target_y
-                current_y = min(current_y, target_y)
-                
-                self.driver.execute_script(f"window.scrollTo(0, {current_y});")
-                # Thêm độ trễ ngẫu nhiên giữa các bước
-                time.sleep(random.uniform(0.01, 0.03))
-            except Exception as e:
-                print(f"Port {self.port}: Scroll error: {e}")
+            # Thêm một chút ngẫu nhiên vào mỗi bước cuộn
+            random_offset = random.uniform(-1, 1)
+            current_y += step_y + random_offset
+            
+            # Đảm bảo không scroll quá target_y
+            current_y = min(current_y, target_y)
+            
+            self.driver.execute_script(f"window.scrollTo(0, {current_y});")
+            # Thêm độ trễ ngẫu nhiên giữa các bước
+            time.sleep(random.uniform(0.01, 0.03))
             
     def close_block_popup(self):
         try:
@@ -562,10 +555,6 @@ class FacebookAdsLibrary:
             print(f"\nProcessing keyword: {keyword}")
             self.current_keyword = keyword
             
-            # Thêm logging chi tiết
-            start_time = time.time()
-            records_processed = 0
-            
             # Check if keyword is already completed
             if keyword in self.tracking_data and 'completed' in self.tracking_data[keyword]:
                 print(f"Keyword '{keyword}' already completed. Skipping...")
@@ -593,11 +582,10 @@ class FacebookAdsLibrary:
             # Send completion report to Telegram
             self.send_keyword_completion_report(output_path)
             
-            print(f"Port {self.port} completed keyword '{keyword}' in {time.time() - start_time:.2f}s")
-            print(f"Records processed: {records_processed}")
+            print(f"Completed processing keyword '{keyword}'")
             
         except Exception as e:
-            print(f"Port {self.port} error processing keyword '{keyword}': {e}")
+            print(f"Error processing keyword '{keyword}': {e}")
         
     def process_keyword_files(self):
         print("Starting to process keyword files...")
