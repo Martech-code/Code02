@@ -6,46 +6,66 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
-import undetected_chromedriver as uc
+from functools import wraps
+import functools
 import time
 import pandas as pd
 import os
 import random
 import json
+import requests
+import threading
+import queue
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
+class ChromeManager:
+    def __init__(self, ports):
+        self.ports = ports
+        self.current_port_index = 0
+        self.lock = threading.Lock()
+
+    def get_next_port(self):
+        with self.lock:
+            port = self.ports[self.current_port_index]
+            self.current_port_index = (self.current_port_index + 1) % len(self.ports)
+            return port
+
+class KeywordProcessor:
+    def __init__(self, keywords_queue, output_path):
+        self.keywords_queue = keywords_queue
+        self.output_path = output_path
+        self.lock = threading.Lock()
+
+    def process_keywords(self, port):
+        scraper = FacebookAdsLibrary(port)
+        if not scraper.setup_driver():
+            print(f"Failed to setup driver for port {port}. Exiting...")
+            return
+
+        try:
+            while True:
+                try:
+                    with self.lock:
+                        if self.keywords_queue.empty():
+                            break
+                        keyword = self.keywords_queue.get()
+                    
+                    print(f"Port {port} processing keyword: {keyword}")
+                    scraper.process_keyword(keyword, self.output_path)
+                    
+                except queue.Empty:
+                    break
+                except Exception as e:
+                    print(f"Error processing keyword on port {port}: {e}")
+                    continue
+        finally:
+            scraper.close()
+
 class FacebookAdsLibrary:
-    def __init__(self):
-        self.chrome_options = uc.ChromeOptions()
-        
-        # Thêm các user agent ngẫu nhiên
-        user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        ]
-        self.chrome_options.add_argument(f'user-agent={random.choice(user_agents)}')
-        
-        # Thêm các tham số stealth
-        self.chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-        self.chrome_options.add_argument('--disable-extensions')
-        
-        # Thay đổi cách set experimental options
-        prefs = {
-            "credentials_enable_service": False,
-            "profile.password_manager_enabled": False,
-            "profile.default_content_setting_values.notifications": 2,
-            "webrtc.ip_handling_policy": "disable_non_proxied_udp",
-            "webrtc.multiple_routes_enabled": False,
-            "webrtc.nonproxied_udp_enabled": False
-        }
-        self.chrome_options.add_experimental_option("prefs", prefs)
-        
-        # Thay đổi cách loại bỏ các switch
-        self.chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
-        self.chrome_options.add_experimental_option('useAutomationExtension', False)
-        
+    def __init__(self, port):
+        self.chrome_options = Options()
+        self.chrome_options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
         self.chrome_options.add_argument('--disable-gpu')
         self.chrome_options.add_argument('--no-sandbox')
         self.chrome_options.add_argument('--disable-dev-shm-usage')
@@ -53,20 +73,8 @@ class FacebookAdsLibrary:
         self.chrome_options.add_argument('--disk-cache-size=1')
         self.chrome_options.add_argument('--media-cache-size=1')
         self.chrome_options.add_argument('--disable-applications-cache')
-        
-        # Khởi tạo service và driver
         self.service = Service()
-        try:
-            self.driver = uc.Chrome(options=self.chrome_options)
-        except Exception as e:
-            print(f"Failed to initialize undetected-chromedriver: {e}")
-            print("Falling back to regular Chrome WebDriver...")
-            try:
-                self.driver = webdriver.Chrome(service=self.service, options=self.chrome_options)
-            except Exception as e:
-                print(f"Failed to initialize regular Chrome WebDriver: {e}")
-                raise
-                
+        self.driver = None
         self.tracking_file = os.path.join("Downloads", "Ads Library Analysis", "tracking.json")
         self.tracking_data = self.load_tracking_data()
         self.current_keyword = None
@@ -117,6 +125,45 @@ class FacebookAdsLibrary:
 
         self.temp_data_buffer = []
         print("Buffer flushed successfully")
+    
+    def simulate_human_scroll(self, start_y, end_y, duration=1.0):
+        """Mô phỏng cuộn chuột tự nhiên của người dùng với khoảng cách scroll từ 200-800px."""
+        print(f"Simulating human scroll from {start_y} to {end_y}")
+        
+        # Tính toán khoảng cách scroll thực tế (random từ 200-800px)
+        scroll_distance = random.uniform(200, 800)
+        
+        # Đảm bảo không scroll quá end_y
+        target_y = min(start_y + scroll_distance, end_y)
+        
+        steps = int(duration * 60)  # 60 bước mỗi giây
+        step_y = (target_y - start_y) / steps
+        
+        current_y = start_y
+        for _ in range(steps):
+            # Thêm một chút ngẫu nhiên vào mỗi bước cuộn
+            random_offset = random.uniform(-1, 1)
+            current_y += step_y + random_offset
+            
+            # Đảm bảo không scroll quá target_y
+            current_y = min(current_y, target_y)
+            
+            self.driver.execute_script(f"window.scrollTo(0, {current_y});")
+            # Thêm độ trễ ngẫu nhiên giữa các bước
+            time.sleep(random.uniform(0.01, 0.03))
+            
+    def close_block_popup(self):
+        try:
+            # Tìm button OK bằng aria-label và class đặc trưng
+            popup = self.driver.find_element(By.XPATH, "//div[@aria-label='OK' and contains(@class, 'x1i10hfl')]")
+            actions = ActionChains(self.driver)
+            actions.click(popup).perform()
+            time.sleep(1)
+            return True
+        except Exception as e:
+            # Thông báo đơn giản và thân thiện hơn
+            print("Không tìm thấy popup cần đóng - có thể popup chưa xuất hiện hoặc đã được đóng trước đó")
+            return False
 
     def parse_runtime(self, runtime_text):
         print(f"Parsing runtime text: {runtime_text}")
@@ -179,53 +226,12 @@ class FacebookAdsLibrary:
     def setup_driver(self):
         print("Setting up Chrome driver...")
         try:
-            # Thêm JavaScript để ghi đè các function detection
-            stealth_js = """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.navigator.chrome = {runtime: {}};
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            """
-            self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-                "source": stealth_js
-            })
-            
-            # Thêm delay ngẫu nhiên cho mỗi action
-            self.add_random_delays()
+            self.driver = webdriver.Chrome(service=self.service, options=self.chrome_options)
+            print("Chrome driver setup successful")
             return True
         except Exception as e:
             print(f"Error setting up driver: {e}")
             return False
-            
-    def add_random_delays(self):
-        def random_delay(min_delay=1, max_delay=5):
-            time.sleep(random.uniform(min_delay, max_delay))
-            
-        # Override một số method của WebDriver để thêm delay
-        original_find_element = self.driver.find_element
-        def find_element_with_delay(*args, **kwargs):
-            random_delay(0.5, 2)
-            return original_find_element(*args, **kwargs)
-        self.driver.find_element = find_element_with_delay
-        
-    def simulate_human_behavior(self):
-        try:
-            # Simulate random mouse movements
-            actions = ActionChains(self.driver)
-            for _ in range(random.randint(3, 7)):
-                actions.move_by_offset(
-                    random.randint(-100, 100),
-                    random.randint(-100, 100)
-                ).perform()
-                time.sleep(random.uniform(0.1, 0.3))
-            
-            # Simulate random scrolling
-            scroll_amount = random.randint(300, 700)
-            self.driver.execute_script(f"window.scrollBy(0, {scroll_amount});")
-            time.sleep(random.uniform(0.5, 1.5))
-            
-        except Exception as e:
-            print(f"Error in human behavior simulation: {e}")
 
     def extract_ad_data(self, ad_element, keyword):
                     print("Extracting ad data...")
@@ -343,7 +349,9 @@ class FacebookAdsLibrary:
 
     def scroll_and_extract(self, output_path):
         print("Starting scroll and extract process...")
-        scroll_pause_time = 5
+        
+        self.close_block_popup()  # Kiểm tra và đóng popup
+        scroll_pause_time = random.uniform(3, 5)  # Thời gian dừng ngẫu nhiên
         last_height = self.driver.execute_script("return document.body.scrollHeight")
         no_new_content_count = 0
         max_no_new_content = 8
@@ -363,8 +371,53 @@ class FacebookAdsLibrary:
         
         while True:
             try:
+                # Kiểm tra và đóng popup trước khi scroll
+                self.close_block_popup()                
+                
                 print("Waiting for ad elements to load...")
-                time.sleep(5)
+                time.sleep(random.uniform(3, 5))
+                
+                # Lấy các thông số cuộn trang
+                current_height = self.driver.execute_script("return document.body.scrollHeight")
+                viewport_height = self.driver.execute_script("return window.innerHeight")
+                current_scroll = self.driver.execute_script("return window.pageYOffset")
+                
+                # Tính khoảng cách còn lại có thể cuộn
+                remaining_scroll = current_height - current_scroll - viewport_height
+                
+                # Luôn đảm bảo có một khoảng cuộn tối thiểu
+                scroll_distance = max(
+                    min(viewport_height * random.uniform(0.5, 1.5),
+                        remaining_scroll + viewport_height * 0.2),  # Thêm một chút dư để đảm bảo luôn có thể cuộn
+                    viewport_height * 0.2  # Khoảng cuộn tối thiểu
+                )
+                
+                # Thực hiện cuộn với khoảng cách đã tính
+                scroll_times = random.randint(1, 3)
+                per_scroll_distance = scroll_distance / scroll_times
+                current_position = current_scroll
+                
+                for i in range(scroll_times):
+                
+                    # Kiểm tra và đóng popup trước mỗi lần scroll nhỏ
+                    self.close_block_popup()                
+                    next_position = current_position + per_scroll_distance
+                    next_position += random.uniform(-50, 50)
+                    next_position = min(next_position, current_height - viewport_height * 0.5)
+                    next_position = max(next_position, current_position)
+                    
+                    self.simulate_human_scroll(
+                        current_position,
+                        next_position,
+                        duration=random.uniform(0.8, 1.5)
+                    )
+                    
+                    current_position = next_position
+                    if i < scroll_times - 1:
+                        time.sleep(random.uniform(1, 2))
+                        
+                    # Kiểm tra và đóng popup sau mỗi lần scroll nhỏ
+                    self.close_block_popup()                        
                 
                 # Tìm tất cả các thẻ div chứa quảng cáo
                 ad_elements = WebDriverWait(self.driver, 10).until(
@@ -417,10 +470,11 @@ class FacebookAdsLibrary:
                             
                             self.temp_data_buffer.append(ad_data)
                             if len(self.temp_data_buffer) >= self.buffer_size:
-                                self.flush_buffer_to_excel(output_path)
+                                self.flush_buffer_to_excel(output_path)                       
                             
                             # Cập nhật phần tử cuối cùng đã xử lý
                             last_processed_element = ad_element
+                                                       
                     
                     except Exception as e:
                         print(f"Error processing ad element: {e}")
@@ -437,13 +491,48 @@ class FacebookAdsLibrary:
                     print("Reached maximum attempts without new content")
                     self.flush_buffer_to_excel(output_path)
                     return
+                    
+                # Kiểm tra và đóng popup sau khi scroll đến cuối trang
+                self.close_block_popup()
                 
-                print("Scrolling to bottom of page...")
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                print("Performing natural scrolling to bottom...")
+                current_position = self.driver.execute_script("return window.pageYOffset")
+                total_height = self.driver.execute_script("return document.body.scrollHeight")
+                viewport_height = self.driver.execute_script("return window.innerHeight")
+                remaining_scroll = total_height - current_position - viewport_height
+
+                # Số lần scroll ngẫu nhiên từ 3-5 lần
+                num_scrolls = random.randint(3, 5)
+                scroll_distance_per_step = remaining_scroll / num_scrolls
+
+                for i in range(num_scrolls):
+                    next_position = current_position + scroll_distance_per_step
+                    # Thêm một chút nhiễu ngẫu nhiên
+                    next_position += random.uniform(-50, 50)
+                    # Đảm bảo không scroll quá giới hạn
+                    next_position = min(next_position, total_height - viewport_height)
+                    
+                    self.simulate_human_scroll(
+                        current_position,
+                        next_position,
+                        duration=random.uniform(0.8, 1.5)
+                    )
+                    
+                    current_position = next_position
+                    
+                    # Thêm độ trễ ngẫu nhiên giữa các lần scroll
+                    time.sleep(random.uniform(1, 2))
+                    
+                    # Kiểm tra và đóng popup sau mỗi lần scroll
+                    self.close_block_popup()
+                    
                 print(f"Waiting for {scroll_pause_time} seconds...")
                 time.sleep(scroll_pause_time)
                 print("Adding random delay...")
                 time.sleep(random.uniform(0.5, 1.5))
+                
+                # Kiểm tra và đóng popup sau khi scroll đến cuối trang
+                self.close_block_popup()                
                 
                 new_height = self.driver.execute_script("return document.body.scrollHeight")
                 
@@ -463,11 +552,6 @@ class FacebookAdsLibrary:
 
     def process_keyword(self, keyword, output_path):
         try:
-            # Thêm random delay trước mỗi request
-            time.sleep(random.uniform(2, 5))
-            # Thêm simulation của human behavior
-            self.simulate_human_behavior()
-            
             print(f"\nProcessing keyword: {keyword}")
             self.current_keyword = keyword
             
@@ -481,8 +565,11 @@ class FacebookAdsLibrary:
             
             print(f"Navigating to URL: {url}")
             self.driver.get(url)
+            self.close_block_popup()  # Kiểm tra và đóng popup
             print("Waiting 5 seconds for page load...")
             time.sleep(5)
+            
+            self.close_block_popup()  # Kiểm tra và đóng popup
             
             self.scroll_and_extract(output_path)
             
@@ -492,105 +579,13 @@ class FacebookAdsLibrary:
             self.tracking_data[keyword]['completed'] = True
             self.save_tracking_data()
             
+            # Send completion report to Telegram
+            self.send_keyword_completion_report(output_path)
+            
             print(f"Completed processing keyword '{keyword}'")
             
         except Exception as e:
             print(f"Error processing keyword '{keyword}': {e}")
-
-    def clear_browser_data(self):
-        """Clear all browser data including cookies, cache, and history."""
-        print("Clearing browser data...")
-        try:
-            # Đóng tất cả tab không cần thiết trước
-            original_window = self.driver.current_window_handle
-            for handle in self.driver.window_handles:
-                if handle != original_window:
-                    self.driver.switch_to.window(handle)
-                    self.driver.close()
-            self.driver.switch_to.window(original_window)
-
-            # Xóa bộ nhớ cache của trình duyệt
-            self.driver.execute_cdp_cmd('Network.clearBrowserCache', {})
-            self.driver.execute_cdp_cmd('Network.clearBrowserCookies', {})
-            
-            # Xóa dữ liệu storage và force garbage collection
-            self.driver.execute_script("""
-                window.localStorage.clear();
-                window.sessionStorage.clear();
-                var cookies = document.cookie.split(';');
-                for (var i = 0; i < cookies.length; i++) {
-                    var cookie = cookies[i];
-                    var eqPos = cookie.indexOf('=');
-                    var name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
-                    document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';
-                }
-                
-                // Force garbage collection nếu có thể
-                if (window.performance && window.performance.memory) {
-                    try {
-                        window.performance.memory.gc && window.performance.memory.gc();
-                    } catch(e) {
-                        // Ignore if gc is not available
-                    }
-                }
-            """)
-            
-            # Xóa cookies
-            self.driver.delete_all_cookies()
-            
-            # Thiết lập giới hạn bộ nhớ cho page
-            self.driver.execute_cdp_cmd('Network.enable', {})
-            self.driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-                "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-            })
-            
-            # Thực hiện thêm các bước để giảm memory usage
-            self.driver.execute_script("""
-                // Xóa các biến không sử dụng
-                for (var prop in window) {
-                    if (window.hasOwnProperty(prop) && prop !== 'performance') {
-                        try {
-                            delete window[prop];
-                        } catch(e) {}
-                    }
-                }
-                // Clear console
-                console.clear();
-            """)
-            
-            # Refresh trang
-            self.driver.refresh()
-            
-            print("Browser data cleared successfully")
-            
-        except Exception as e:
-            print(f"Error clearing browser data: {e}")
-            # Tiếp tục thực hiện mặc dù có lỗi
-        
-        # Verify cookies
-        remaining_cookies = self.driver.get_cookies()
-        if remaining_cookies:
-            print(f"Warning: {len(remaining_cookies)} cookies still remain")
-        else:
-            print("All cookies have been cleared")
-
-        # Kiểm tra memory usage
-        memory_info = self.driver.execute_script("""
-            return window.performance.memory ? {
-                totalJSHeapSize: window.performance.memory.totalJSHeapSize,
-                usedJSHeapSize: window.performance.memory.usedJSHeapSize,
-                jsHeapSizeLimit: window.performance.memory.jsHeapSizeLimit
-            } : null;
-        """)
-        
-        if memory_info:
-            print(f"Memory usage: {memory_info}")
-
-        # Thực hiện force garbage collection thông qua CDP
-        try:
-            self.driver.execute_cdp_cmd('HeapProfiler.collectGarbage', {})
-        except:
-            pass
         
     def process_keyword_files(self):
         print("Starting to process keyword files...")
@@ -612,15 +607,71 @@ class FacebookAdsLibrary:
                     print(f"\nProcessing keyword: {keyword}")
                     self.process_keyword(keyword, output_path)
                     
-                    # Clear browser data after processing each keyword
-                    print("Clearing browser data before next keyword...")
-                    self.clear_browser_data()
-                    
                     print("Waiting 2 seconds before next keyword...")
-                    time.sleep(2)
+                    time.sleep(random.uniform(1, 3)) 
                 
         except Exception as e:
             print(f"Error processing keyword files: {e}")
+            
+    def send_telegram_message(self, message):
+        """Send message to Telegram channel."""
+        bot_token = "7584627793:AAHPB4zaMSTYgu2P6N9RMlplr0KcFMP1FQQ"
+        chat_id = "-1002371940283"
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        
+        try:
+            response = requests.post(url, json={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            })
+            if response.status_code != 200:
+                print(f"Failed to send Telegram message: {response.text}")
+        except Exception as e:
+            print(f"Error sending Telegram message: {e}")
+
+    def get_excel_row_count(self, output_path):
+        """Get the number of rows in Excel file for current keyword."""
+        try:
+            if os.path.exists(output_path):
+                df = pd.read_excel(output_path)
+                return len(df[df['keyword'] == self.current_keyword])
+            return 0
+        except Exception as e:
+            print(f"Error counting Excel rows: {e}")
+            return 0
+
+    def send_keyword_completion_report(self, output_path):
+        """Send completion report for current keyword to Telegram."""
+        try:
+            if self.current_keyword in self.tracking_data:
+                data = self.tracking_data[self.current_keyword]
+                first_runtime = datetime.strptime(data['first_runtime'], "%Y-%m-%d")
+                
+                # Get the last runtime from Excel
+                df = pd.read_excel(output_path)
+                keyword_data = df[df['keyword'] == self.current_keyword]
+                if not keyword_data.empty:
+                    last_runtime_str = keyword_data['runtime'].iloc[-1]
+                    last_runtime = self.parse_runtime(last_runtime_str)
+                    last_runtime_str = last_runtime.strftime("%Y-%m-%d") if last_runtime else "Unknown"
+                else:
+                    last_runtime_str = "Unknown"
+                
+                row_count = self.get_excel_row_count(output_path)
+                
+                message = (
+                    f"📊 Keyword Report: <b>{self.current_keyword}</b>\n\n"
+                    f"📅 First data: {data['first_runtime']}\n"
+                    f"🎯 Target date: {data['target_date']}\n"
+                    f"🛑 Last data: {last_runtime_str}\n"
+                    f"📝 Total ads found: {row_count}"
+                )
+                
+                self.send_telegram_message(message)
+                
+        except Exception as e:
+            print(f"Error sending completion report: {e}")
 
     def close(self):
         print("Closing browser...")
@@ -630,28 +681,40 @@ class FacebookAdsLibrary:
 
 def main():
     print("Starting Facebook Ads Library Scraper...")
-    try:
-        os.makedirs(os.path.join("Downloads", "Ads Library Analysis"), exist_ok=True)
-        print("Created necessary directories")
-    except Exception as e:
-        print(f"Error creating directories: {e}")
-        return
+    os.makedirs(os.path.join("Downloads", "Ads Library Analysis"), exist_ok=True)
+    print("Created necessary directories")
 
-    scraper = None
-    try:
-        scraper = FacebookAdsLibrary()
-        print("Initialized scraper")
+    # Định nghĩa các ports cho Chrome instances
+    chrome_ports = [9226, 9227]  # Thêm port thứ 2
+    chrome_manager = ChromeManager(chrome_ports)
 
-        if not scraper.setup_driver():
-            print("Failed to setup driver. Exiting...")
-            return
+    ads_library_dir = os.path.join("Downloads", "Ads Library Analysis")
+    txt_files = [f for f in os.listdir(ads_library_dir) if f.endswith('.txt')]
 
-        scraper.process_keyword_files()
-    except Exception as e:
-        print(f"Error in main execution: {e}")
-    finally:
-        if scraper:
-            scraper.close()
+    for txt_file in txt_files:
+        txt_path = os.path.join(ads_library_dir, txt_file)
+        output_path = os.path.join(ads_library_dir, f"{os.path.splitext(txt_file)[0]}_results.xlsx")
+
+        # Đọc keywords từ file và đưa vào queue
+        keywords_queue = queue.Queue()
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    keywords_queue.put(line.strip())
+
+        # Khởi tạo processor
+        processor = KeywordProcessor(keywords_queue, output_path)
+
+        # Tạo và chạy các threads
+        threads = []
+        for port in chrome_ports:
+            thread = threading.Thread(target=processor.process_keywords, args=(port,))
+            threads.append(thread)
+            thread.start()
+
+        # Đợi tất cả threads hoàn thành
+        for thread in threads:
+            thread.join()
 
 if __name__ == "__main__":
     main()
