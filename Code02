@@ -37,6 +37,7 @@ class KeywordProcessor:
         self.keywords_queue = keywords_queue
         self.output_path = output_path
         self.lock = threading.Lock()
+        self.queue_lock = threading.Lock()
 
     def process_keywords(self, port):
         scraper = FacebookAdsLibrary(port)
