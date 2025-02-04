@@ -190,15 +190,16 @@ class FacebookAdsLibrary:
             
     def close_block_popup(self):
         try:
-            # Tìm button OK bằng aria-label và class đặc trưng
             popup = self.driver.find_element(By.XPATH, "//div[@aria-label='OK' and contains(@class, 'x1i10hfl')]")
-            actions = ActionChains(self.driver)
-            actions.click(popup).perform()
-            time.sleep(1)
+            message = f"🚫 Block Popup detected!\n\n" \
+                     f"Keyword: {self.current_keyword}\n" \
+                     f"Chrome Port: {self.chrome_options.debugger_address}\n" \
+                     f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            self.send_telegram_message(message)
+            print("Phát hiện Block Popup - Dừng thực thi Chrome")
+            self.driver.quit()
             return True
         except Exception as e:
-            # Thông báo đơn giản và thân thiện hơn
-            print("Không tìm thấy popup cần đóng - có thể popup chưa xuất hiện hoặc đã được đóng trước đó")
             return False
 
     def parse_runtime(self, runtime_text):
@@ -386,7 +387,11 @@ class FacebookAdsLibrary:
     def scroll_and_extract(self, output_path):
         print("Starting scroll and extract process...")
         
-        self.close_block_popup()  # Kiểm tra và đóng popup
+        # Kiểm tra popup và dừng nếu chrome đã bị đóng
+        if self.close_block_popup():
+            print("Chrome đã bị dừng do phát hiện Block Popup")
+            return
+            
         scroll_pause_time = random.uniform(3, 5)  # Thời gian dừng ngẫu nhiên
         last_height = self.driver.execute_script("return document.body.scrollHeight")
         no_new_content_count = 0
@@ -601,11 +606,19 @@ class FacebookAdsLibrary:
             
             print(f"Navigating to URL: {url}")
             self.driver.get(url)
-            self.close_block_popup()  # Kiểm tra và đóng popup
+            
+            # Kiểm tra popup và dừng nếu chrome đã bị đóng
+            if self.close_block_popup():
+                print(f"Dừng xử lý keyword '{keyword}' do phát hiện Block Popup")
+                return
+            
             print("Waiting 5 seconds for page load...")
             time.sleep(5)
             
-            self.close_block_popup()  # Kiểm tra và đóng popup
+            # Kiểm tra lại popup sau khi load
+            if self.close_block_popup():
+                print(f"Dừng xử lý keyword '{keyword}' do phát hiện Block Popup")
+                return
             
             self.scroll_and_extract(output_path)
             
