@@ -760,7 +760,7 @@ def main():
     print("Created necessary directories")
 
     # Định nghĩa các ports cho Chrome instances
-    chrome_ports = [9226, 9227]  # Thêm port thứ 2
+    chrome_ports = [9222, 9223]  # Thêm port thứ 2
     chrome_manager = ChromeManager(chrome_ports)
 
     ads_library_dir = os.path.join("Downloads", "Ads Library Analysis")
