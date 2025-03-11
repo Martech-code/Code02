@@ -35,6 +35,53 @@ CHROME_INACTIVITY_TIMEOUT = 300  # 5 minutes in seconds
 # TELEGRAM_TOKEN = "7584627793:AAHPB4zaMSTYgu2P6N9RMlplr0KcFMP1FQQ"
 # TELEGRAM_CHAT_ID = "-1002371940283"
 
+# Quản lý vị trí cửa sổ Chrome
+class WindowPositionManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        # Giả định màn hình có kích thước 1920x1080
+        self.screen_width = 1920
+        self.screen_height = 1080
+        
+        # Kích thước cho mỗi cửa sổ Chrome
+        self.window_width = self.screen_width // 5  # 5 cửa sổ trên mỗi hàng
+        self.window_height = self.screen_height // 2  # 2 hàng (trên và dưới)
+        
+        # Theo dõi các vị trí đã được sử dụng
+        self.used_positions = {}  # {worker_id: (x, y)}
+        
+        # Tạo danh sách tất cả các vị trí có thể
+        self.available_positions = []
+        for row in range(2):  # 2 hàng
+            for col in range(5):  # 5 cửa sổ mỗi hàng
+                x = col * self.window_width
+                y = row * self.window_height
+                self.available_positions.append((x, y))
+    
+    def get_position(self, worker_id):
+        with self.lock:
+            # Nếu worker_id đã có vị trí, trả về vị trí đó
+            if worker_id in self.used_positions:
+                return self.used_positions[worker_id], self.window_width, self.window_height
+            
+            # Nếu còn vị trí trống, cấp phát vị trí mới
+            if self.available_positions:
+                position = self.available_positions.pop(0)
+                self.used_positions[worker_id] = position
+                return position, self.window_width, self.window_height
+            
+            # Nếu không còn vị trí nào, trả về vị trí mặc định (0,0)
+            return (0, 0), self.window_width, self.window_height
+    
+    def release_position(self, worker_id):
+        with self.lock:
+            if worker_id in self.used_positions:
+                position = self.used_positions.pop(worker_id)
+                self.available_positions.append(position)
+
+# Khởi tạo window position manager
+window_manager = WindowPositionManager()
+
 def calculate_std_dev(values):
     n = len(values)
     if n < 2:
@@ -127,15 +174,34 @@ class ChromeInstance:
         if self.chrome_command:
             try:
                 print(f"[Worker {self.worker_id}] Khởi động Chrome port {self.debug_port}")
-                self.process = subprocess.Popen(self.chrome_command, shell=True)
+                
+                # Lấy thông tin vị trí cửa sổ từ window manager
+                (x, y), width, height = window_manager.get_position(self.worker_id)
+                
+                # Thêm tham số vị trí và kích thước vào lệnh gọi Chrome
+                modified_command = self.chrome_command
+                
+                # Xóa bỏ tham số cũ về vị trí và kích thước nếu có
+                modified_command = re.sub(r'--window-position=\S+', '', modified_command)
+                modified_command = re.sub(r'--window-size=\S+', '', modified_command)
+                
+                # Thêm tham số mới về vị trí và kích thước
+                modified_command = f"{modified_command} --window-position={x},{y} --window-size={width},{height}"
+                
+                self.process = subprocess.Popen(modified_command, shell=True)
                 time.sleep(5)  # Đợi Chrome khởi động
                 return True
             except Exception as e:
                 print(f"[Worker {self.worker_id}] Lỗi khởi động Chrome: {str(e)}")
+                # Giải phóng vị trí nếu khởi động thất bại
+                window_manager.release_position(self.worker_id)
                 return False
         return False
 
     def kill_chrome(self):
+        # Giải phóng vị trí cửa sổ trước khi đóng Chrome
+        window_manager.release_position(self.worker_id)
+        
         if self.driver:
             try:
                 self.driver.quit()
