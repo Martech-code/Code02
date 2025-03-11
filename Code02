@@ -208,6 +208,34 @@ class ChromeInstance:
             return blocked_text in page_source or blocked_text_2 in page_source
         except:
             return False
+            
+    def check_logout(self):
+        try:
+            # Kiểm tra tiêu đề tab
+            current_title = self.driver.title
+            if "Page not found" in current_title:
+                print(f"[Worker {self.worker_id}] Phát hiện 'Page not found' trong tiêu đề, có thể đã bị logout")
+                return True
+                
+            # Kiểm tra nội dung trang
+            if "Page not found" in self.driver.page_source:
+                print(f"[Worker {self.worker_id}] Phát hiện 'Page not found' trong nội dung trang, có thể đã bị logout")
+                return True
+                
+            # Kiểm tra URL đăng nhập
+            current_url = self.driver.current_url.lower()
+            login_indicators = [
+                "facebook.com/login",
+                "/login/?next"
+            ]
+            if any(indicator in current_url for indicator in login_indicators):
+                print(f"[Worker {self.worker_id}] Phát hiện URL đăng nhập, đã bị logout")
+                return True
+                
+            return False
+        except Exception as e:
+            print(f"[Worker {self.worker_id}] Lỗi khi kiểm tra logout: {str(e)}")
+            return False
 
     def check_suspicious(self):
         try:
@@ -254,6 +282,11 @@ class ChromeInstance:
         previous_unique_count = 0
         last_height = self.driver.execute_script("return document.documentElement.scrollHeight")
         
+        # Kiểm tra logout trước khi bắt đầu thu thập
+        if self.check_logout():
+            print(f"[Worker {self.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
+            return group_links
+        
         while True:
             current_height = self.driver.execute_script("return window.pageYOffset")
             target_height = min(current_height + 300, last_height)
@@ -261,6 +294,11 @@ class ChromeInstance:
             time.sleep(0.3)
 
             time.sleep(SCROLL_PAUSE_TIME)
+            
+            # Kiểm tra logout sau mỗi lần scroll
+            if self.check_logout():
+                print(f"[Worker {self.worker_id}] Phát hiện Chrome đã logout, dừng thu thập URLs")
+                break
             
             actual_height = self.driver.execute_script("return window.pageYOffset")
             if abs(actual_height - target_height) > 50:
@@ -423,6 +461,12 @@ def process_single_group(chrome_instance, group_url, search_keywords, output_fil
         chrome_instance.update_activity_time()
         
         time.sleep(random.uniform(2, 3))
+        
+        # Kiểm tra logout
+        if chrome_instance.check_logout():
+            print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
+            chrome_instance.kill_chrome()
+            return False
 
         def handle_popup():
             """Xử lý popup block"""
@@ -597,6 +641,27 @@ def worker_process(chrome_instance: ChromeInstance, keywords: List[str], process
 
                 print(f"[Worker {chrome_instance.worker_id}] Đang xử lý nhóm {idx}/{total_remaining} (Index: {current_index})")
                 
+                # Kiểm tra logout trước khi xử lý URL
+                if chrome_instance.check_logout():
+                    print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
+                    chrome_instance.kill_chrome()
+                    
+                    # Lưu tiến độ hiện tại trước khi khởi động lại
+                    chrome_instance.save_progress(
+                        progress_data['keyword'],
+                        progress_data['urls'],
+                        current_index,
+                        output_dir
+                    )
+                    
+                    # Khởi động lại Chrome
+                    chrome_instance.start_chrome()
+                    try:
+                        driver = chrome_instance.create_driver()
+                    except Exception as e:
+                        print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+                        break
+                
                 try:
                     if process_single_group(chrome_instance, group_url, progress_data['keyword'], output_file, lock):
                         with lock:
@@ -675,6 +740,16 @@ def worker_process(chrome_instance: ChromeInstance, keywords: List[str], process
                     print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
                     break
 
+            if chrome_instance.check_logout():
+                print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
+                chrome_instance.kill_chrome()
+                chrome_instance.start_chrome()
+                try:
+                    driver = chrome_instance.create_driver()
+                except Exception as e:
+                    print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+                    break
+
             if chrome_instance.check_checkpoint():
                 chrome_instance.is_checkpoint = True
                 print(f"[Worker {chrome_instance.worker_id}] Tài khoản bị checkpoint, dừng worker")
@@ -707,6 +782,18 @@ def worker_process(chrome_instance: ChromeInstance, keywords: List[str], process
                 driver.get(search_url)
                 chrome_instance.update_activity_time()
                 time.sleep(random.uniform(2, 3))
+                
+                # Kiểm tra logout sau khi truy cập search_url
+                if chrome_instance.check_logout():
+                    print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
+                    chrome_instance.kill_chrome()
+                    chrome_instance.start_chrome()
+                    try:
+                        driver = chrome_instance.create_driver()
+                        continue  # Bỏ qua từ khóa này và thử lại với từ khóa khác
+                    except Exception as e:
+                        print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+                        break
 
                 group_urls = chrome_instance.scroll_and_collect_groups()
                 if not group_urls:
@@ -727,6 +814,27 @@ def worker_process(chrome_instance: ChromeInstance, keywords: List[str], process
                         continue
 
                     print(f"[Worker {chrome_instance.worker_id}] Đang xử lý nhóm {idx}/{total_urls}")
+                    
+                    # Kiểm tra logout trước khi xử lý mỗi URL
+                    if chrome_instance.check_logout():
+                        print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
+                        chrome_instance.kill_chrome()
+                        
+                        # Lưu tiến độ hiện tại trước khi khởi động lại
+                        chrome_instance.save_progress(
+                            search_keywords,
+                            group_urls,
+                            idx - 1,
+                            output_dir
+                        )
+                        
+                        # Khởi động lại Chrome
+                        chrome_instance.start_chrome()
+                        try:
+                            driver = chrome_instance.create_driver()
+                        except Exception as e:
+                            print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+                            break
                     
                     # Lưu tiến độ trước khi xử lý mỗi URL
                     chrome_instance.save_progress(
