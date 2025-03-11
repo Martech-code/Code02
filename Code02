@@ -20,6 +20,8 @@ import requests
 import threading
 import math
 import sys
+import subprocess
+import psutil
 
 # Configuration parameters
 MIN_DELAY_BETWEEN_REQUESTS = 0.5
@@ -29,6 +31,7 @@ PAGE_LOAD_TIMEOUT = 10
 TAB_SWITCH_DELAY = 0.2
 MAX_TABS = 5
 SCROLL_PAUSE_TIME = 2
+CHROME_INACTIVITY_TIMEOUT = 300  # 5 minutes in seconds
 # TELEGRAM_TOKEN = "7584627793:AAHPB4zaMSTYgu2P6N9RMlplr0KcFMP1FQQ"
 # TELEGRAM_CHAT_ID = "-1002371940283"
 
@@ -41,7 +44,7 @@ def calculate_std_dev(values):
     return math.sqrt(squared_diff_sum / (n - 1))
 
 class ChromeInstance:
-    def __init__(self, debug_port, worker_id):
+    def __init__(self, debug_port, worker_id, chrome_command=None):
         self.debug_port = debug_port
         self.worker_id = worker_id
         self.driver = None
@@ -51,11 +54,15 @@ class ChromeInstance:
         self.processed_groups = set()
         self.collected_urls = []
         self.failed_urls = []
-        self.processed_urls = set()  # Thêm tracking URLs đã xử lý
-        self.skipped_urls = []      # Thêm tracking URLs bị bỏ qua
+        self.processed_urls = set()
+        self.skipped_urls = []
+        self.chrome_command = chrome_command
+        self.process = None
+        self.last_activity_time = datetime.now()
         
     def track_processed_url(self, url):
         self.processed_urls.add(url)
+        self.update_activity_time()
         
     def track_skipped_url(self, url, reason):
         self.skipped_urls.append({
@@ -63,6 +70,14 @@ class ChromeInstance:
             'timestamp': datetime.now().isoformat(),
             'reason': reason
         })
+        self.update_activity_time()
+
+    def update_activity_time(self):
+        self.last_activity_time = datetime.now()
+
+    def is_inactive(self):
+        inactive_time = (datetime.now() - self.last_activity_time).total_seconds()
+        return inactive_time > CHROME_INACTIVITY_TIMEOUT
 
     def save_progress(self, keyword, urls, current_index, output_dir):
         progress_file = os.path.join(output_dir, f'progress_worker_{self.worker_id}.json')
@@ -75,6 +90,7 @@ class ChromeInstance:
         try:
             with open(progress_file, 'w', encoding='utf-8') as f:
                 json.dump(progress_data, f, ensure_ascii=False, indent=2)
+            self.update_activity_time()
         except Exception as e:
             print(f"[Worker {self.worker_id}] Lỗi lưu tiến độ: {str(e)}")
 
@@ -107,12 +123,54 @@ class ChromeInstance:
         chrome_options.add_argument('--lang=vi')
         return chrome_options
 
+    def start_chrome(self):
+        if self.chrome_command:
+            try:
+                print(f"[Worker {self.worker_id}] Khởi động Chrome port {self.debug_port}")
+                self.process = subprocess.Popen(self.chrome_command, shell=True)
+                time.sleep(5)  # Đợi Chrome khởi động
+                return True
+            except Exception as e:
+                print(f"[Worker {self.worker_id}] Lỗi khởi động Chrome: {str(e)}")
+                return False
+        return False
+
+    def kill_chrome(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except:
+                pass
+            
+        if self.process:
+            try:
+                self.process.terminate()
+                time.sleep(1)
+                if self.process.poll() is None:
+                    self.process.kill()
+            except:
+                pass
+                
+        # Tìm và kill tất cả các process Chrome có port tương ứng
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                if proc.info['name'] and 'chrome' in proc.info['name'].lower():
+                    cmdline = ' '.join(proc.info['cmdline'] or [])
+                    if f"--remote-debugging-port={self.debug_port}" in cmdline:
+                        try:
+                            proc.kill()
+                        except:
+                            pass
+        except:
+            pass
+
     def create_driver(self):
         try:
             options = self.setup_chrome_driver()
             service = Service()
             self.driver = webdriver.Chrome(service=service, options=options)
             self.driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+            self.update_activity_time()
             return self.driver
         except Exception as e:
             raise Exception(f"Lỗi khởi tạo Chrome WebDriver port {self.debug_port}: {str(e)}")
@@ -123,6 +181,7 @@ class ChromeInstance:
             actions = ActionChains(self.driver)
             actions.double_click(popup).perform()
             time.sleep(1)
+            self.update_activity_time()
             return True
         except:
             return False
@@ -166,6 +225,7 @@ class ChromeInstance:
                         actions.double_click(skip_button[0]).perform()
                         print(f"[Worker {self.worker_id}] Đã click nút Bỏ qua trên trang Checkpoint")
                         time.sleep(1)
+                        self.update_activity_time()
                         return True
                     except Exception as e:
                         print(f"[Worker {self.worker_id}] Lỗi khi click nút Bỏ qua: {str(e)}")
@@ -182,6 +242,7 @@ class ChromeInstance:
             current_url = self.driver.current_url
             if "facebook.com/checkpoint/601051028565049" in current_url.lower():
                 self.check_suspicious()
+                self.update_activity_time()
         except Exception as e:
             print(f"[Worker {self.worker_id}] Lỗi khi theo dõi URL: {str(e)}")
 
@@ -254,7 +315,17 @@ class ChromeInstance:
                     break
 
         print(f"[Worker {self.worker_id}] Tổng cộng đã thu thập được {len(group_links)} URLs độc nhất")
+        self.update_activity_time()
         return group_links  # Trả về list thay vì set
+
+def load_chrome_commands(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            commands = [line.strip() for line in f.readlines() if line.strip()]
+        return commands
+    except Exception as e:
+        print(f"Lỗi khi đọc file chrome_commands.txt: {str(e)}")
+        return []
 
 def save_group_urls(urls, keyword, output_dir, worker_id):
     file_path = os.path.join(output_dir, f'collected_urls_worker_{worker_id}.json')
@@ -349,6 +420,7 @@ def process_single_group(chrome_instance, group_url, search_keywords, output_fil
     try:
         chrome_instance.driver.get(group_url)
         chrome_instance.url_monitor()
+        chrome_instance.update_activity_time()
         
         time.sleep(random.uniform(2, 3))
 
@@ -464,6 +536,7 @@ def process_single_group(chrome_instance, group_url, search_keywords, output_fil
                         writer.writeheader()
                     writer.writerow(group_data)
                 print(f"[Worker {chrome_instance.worker_id}] Đã lưu thành công nhóm: {group_name}")
+                chrome_instance.update_activity_time()
                 return True
             except Exception as e:
                 print(f"[Worker {chrome_instance.worker_id}] Lỗi lưu dữ liệu: {str(e)}")
@@ -481,9 +554,22 @@ def process_single_group(chrome_instance, group_url, search_keywords, output_fil
             return process_single_group(chrome_instance, group_url, search_keywords, output_file, lock, retry_count + 1)
         return False
 
-def worker_process(chrome_instance: ChromeInstance, keywords: List[str], processed_items: set, processed_groups: set, lock, output_dir):
+def worker_process(chrome_instance: ChromeInstance, keywords: List[str], processed_items: set, processed_groups: set, lock, output_dir, available_chrome_commands, active_chrome_instances):
     try:
-        driver = chrome_instance.create_driver()
+        # Khởi động Chrome instance
+        if not chrome_instance.start_chrome():
+            print(f"[Worker {chrome_instance.worker_id}] Không thể khởi động Chrome")
+            return
+            
+        try:
+            driver = chrome_instance.create_driver()
+            with lock:
+                active_chrome_instances[chrome_instance.worker_id] = chrome_instance
+        except Exception as e:
+            print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo driver: {str(e)}")
+            chrome_instance.kill_chrome()
+            return
+            
         output_file = os.path.join(output_dir, 'groups_data.csv')
         retry_count = 0
 
@@ -531,6 +617,27 @@ def worker_process(chrome_instance: ChromeInstance, keywords: List[str], process
                         'reason': str(e)
                     })
 
+                # Kiểm tra nếu chrome bị đơ
+                if chrome_instance.is_inactive():
+                    print(f"[Worker {chrome_instance.worker_id}] Chrome instance không hoạt động quá 5 phút, khởi động lại...")
+                    chrome_instance.kill_chrome()
+                    
+                    # Lưu tiến độ hiện tại trước khi khởi động lại
+                    chrome_instance.save_progress(
+                        progress_data['keyword'],
+                        progress_data['urls'],
+                        current_index + 1,
+                        output_dir
+                    )
+                    
+                    # Khởi động lại Chrome
+                    chrome_instance.start_chrome()
+                    try:
+                        driver = chrome_instance.create_driver()
+                    except Exception as e:
+                        print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+                        break
+
                 # Lưu tiến độ sau mỗi URL
                 chrome_instance.save_progress(
                     progress_data['keyword'],
@@ -557,6 +664,17 @@ def worker_process(chrome_instance: ChromeInstance, keywords: List[str], process
             print(f"[Worker {chrome_instance.worker_id}] Đã hoàn thành xử lý các URL còn lại")
 
         while True:
+            # Kiểm tra nếu chrome bị đơ
+            if chrome_instance.is_inactive():
+                print(f"[Worker {chrome_instance.worker_id}] Chrome instance không hoạt động quá 5 phút, khởi động lại...")
+                chrome_instance.kill_chrome()
+                chrome_instance.start_chrome()
+                try:
+                    driver = chrome_instance.create_driver()
+                except Exception as e:
+                    print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+                    break
+
             if chrome_instance.check_checkpoint():
                 chrome_instance.is_checkpoint = True
                 print(f"[Worker {chrome_instance.worker_id}] Tài khoản bị checkpoint, dừng worker")
@@ -587,6 +705,7 @@ def worker_process(chrome_instance: ChromeInstance, keywords: List[str], process
 
                 print(f"\n[Worker {chrome_instance.worker_id}] Tìm kiếm với từ khóa: {search_keywords}")
                 driver.get(search_url)
+                chrome_instance.update_activity_time()
                 time.sleep(random.uniform(2, 3))
 
                 group_urls = chrome_instance.scroll_and_collect_groups()
@@ -625,6 +744,27 @@ def worker_process(chrome_instance: ChromeInstance, keywords: List[str], process
                     else:
                         failed_urls += 1
 
+                    # Kiểm tra nếu chrome bị đơ
+                    if chrome_instance.is_inactive():
+                        print(f"[Worker {chrome_instance.worker_id}] Chrome instance không hoạt động quá 5 phút, khởi động lại...")
+                        chrome_instance.kill_chrome()
+                        
+                        # Lưu tiến độ hiện tại trước khi khởi động lại
+                        chrome_instance.save_progress(
+                            search_keywords,
+                            group_urls,
+                            idx,
+                            output_dir
+                        )
+                        
+                        # Khởi động lại Chrome
+                        chrome_instance.start_chrome()
+                        try:
+                            driver = chrome_instance.create_driver()
+                        except Exception as e:
+                            print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+                            break
+
                     time.sleep(random.uniform(MIN_DELAY_BETWEEN_REQUESTS, MAX_DELAY_BETWEEN_REQUESTS))
 
                 # Xóa file tiến độ sau khi hoàn thành keyword
@@ -662,8 +802,37 @@ def worker_process(chrome_instance: ChromeInstance, keywords: List[str], process
     finally:
         if chrome_instance.failed_urls:
             save_failed_urls(chrome_instance.failed_urls, output_dir, chrome_instance.worker_id)
+            
+        # Xóa instance khỏi dict active_chrome_instances
+        with lock:
+            if chrome_instance.worker_id in active_chrome_instances:
+                del active_chrome_instances[chrome_instance.worker_id]
+        
         if chrome_instance.driver:
-            chrome_instance.driver.quit()
+            try:
+                chrome_instance.driver.quit()
+            except:
+                pass
+                
+        chrome_instance.kill_chrome()
+        
+        # Khởi động Chrome instance mới nếu còn lệnh chrome trong hàng đợi
+        with lock:
+            if available_chrome_commands:
+                new_command = available_chrome_commands.pop(0)
+                new_port_match = re.search(r'--remote-debugging-port=(\d+)', new_command)
+                if new_port_match:
+                    new_port = int(new_port_match.group(1))
+                    new_worker_id = new_port - 9222 + 1
+                    print(f"Khởi động worker mới với port {new_port} (Worker ID: {new_worker_id})")
+                    
+                    new_chrome = ChromeInstance(debug_port=new_port, worker_id=new_worker_id, chrome_command=new_command)
+                    new_thread = threading.Thread(
+                        target=worker_process,
+                        args=(new_chrome, keywords, processed_items, processed_groups, lock, output_dir, available_chrome_commands, active_chrome_instances)
+                    )
+                    new_thread.daemon = True
+                    new_thread.start()
 
 def load_keywords(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -800,23 +969,59 @@ def count_active_workers(log_file):
             # print(f"Error in monitor_workers: {str(e)}")
             # time.sleep(60)  # Wait 1 minute before retrying if there's an error
 
+# Hàm để giám sát và khởi động lại Chrome instances nếu bị đơ
+def chrome_activity_monitor(active_chrome_instances, lock, available_chrome_commands, keywords, processed_items, processed_groups, output_dir):
+    while True:
+        time.sleep(60)  # Kiểm tra mỗi phút
+        inactive_instances = []
+        
+        with lock:
+            for worker_id, chrome_instance in list(active_chrome_instances.items()):
+                if chrome_instance.is_inactive():
+                    print(f"[Monitor] Chrome instance {worker_id} không hoạt động quá 5 phút, sẽ được thay thế")
+                    inactive_instances.append(worker_id)
+                    
+            # Khởi động Chrome instances mới để thay thế các instance không hoạt động
+            for worker_id in inactive_instances:
+                chrome_instance = active_chrome_instances[worker_id]
+                chrome_instance.kill_chrome()
+                del active_chrome_instances[worker_id]
+                
+                # Kiểm tra xem có lệnh chrome nào khả dụng không
+                if available_chrome_commands:
+                    new_command = available_chrome_commands.pop(0)
+                    new_port_match = re.search(r'--remote-debugging-port=(\d+)', new_command)
+                    if new_port_match:
+                        new_port = int(new_port_match.group(1))
+                        new_worker_id = new_port - 9222 + 1
+                        print(f"[Monitor] Khởi động worker mới với port {new_port} (Worker ID: {new_worker_id}) để thay thế worker {worker_id}")
+                        
+                        new_chrome = ChromeInstance(debug_port=new_port, worker_id=new_worker_id, chrome_command=new_command)
+                        new_thread = threading.Thread(
+                            target=worker_process,
+                            args=(new_chrome, keywords, processed_items, processed_groups, lock, output_dir, available_chrome_commands, active_chrome_instances)
+                        )
+                        new_thread.daemon = True
+                        new_thread.start()
+
 def main():
     input_file = r'C:\Users\Admin-DL\Downloads\Tìm Group Công Khai\Keyword.txt'
     output_dir = r'C:\Users\Admin-DL\Downloads\Tìm Group Công Khai\output'
+    chrome_commands_file = r'C:\Users\Admin-DL\Downloads\chrome_commands.txt'
 
     os.makedirs(output_dir, exist_ok=True)
     
     # Add this line to capture all console output
     sys.stdout = OutputLogger(output_dir)
-    
-    # Start worker monitoring in a separate thread
-    # monitor_thread = threading.Thread(
-        # target=monitor_workers,
-        # args=(output_dir, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
-    # )
-    # monitor_thread.daemon = True
-    # monitor_thread.start()
 
+    # Load Chrome commands from file
+    chrome_commands = load_chrome_commands(chrome_commands_file)
+    if not chrome_commands:
+        print("Không tìm thấy file chrome_commands.txt hoặc file rỗng")
+        return
+    
+    print(f"Đã tải {len(chrome_commands)} lệnh Chrome từ file")
+    
     keywords = load_keywords(input_file)
     processed_items, processed_groups = load_progress(output_dir)
     processed_items = set(processed_items)
@@ -830,30 +1035,43 @@ def main():
     print(f"Số tổ hợp đã sử dụng: {used_combinations}")
     print(f"Còn lại: {total_combinations - used_combinations} tổ hợp chưa sử dụng")
 
-    chrome_instances = [
-        ChromeInstance(debug_port=9222, worker_id=1),
-        ChromeInstance(debug_port=9223, worker_id=2),
-        ChromeInstance(debug_port=9224, worker_id=3),
-        ChromeInstance(debug_port=9225, worker_id=4),
-        ChromeInstance(debug_port=9226, worker_id=5),
-        ChromeInstance(debug_port=9227, worker_id=6),
-        ChromeInstance(debug_port=9228, worker_id=7),
-        ChromeInstance(debug_port=9229, worker_id=8),
-        ChromeInstance(debug_port=9230, worker_id=9),
-        ChromeInstance(debug_port=9231, worker_id=10)
-    ]
-
+    # Khởi tạo các biến dùng chung
     lock = threading.Lock()
+    active_chrome_instances = {}  # Dictionary để theo dõi các Chrome instances đang hoạt động
+    available_chrome_commands = chrome_commands.copy()  # Sao chép danh sách lệnh để tránh thay đổi gốc
+    
+    # Số lượng Chrome instances chạy cùng lúc (ban đầu là 10)
+    max_concurrent_instances = min(10, len(chrome_commands))
+    
+    # Khởi động thread giám sát hoạt động của các Chrome instances
+    monitor_thread = threading.Thread(
+        target=chrome_activity_monitor,
+        args=(active_chrome_instances, lock, available_chrome_commands, keywords, processed_items, processed_groups, output_dir)
+    )
+    monitor_thread.daemon = True
+    monitor_thread.start()
 
+    # Khởi động các Chrome instances đầu tiên
     threads = []
-    for chrome_instance in chrome_instances:
-        thread = threading.Thread(
-            target=worker_process,
-            args=(chrome_instance, keywords, processed_items, processed_groups, lock, output_dir)
-        )
-        threads.append(thread)
-        thread.start()
+    for i in range(max_concurrent_instances):
+        if i < len(available_chrome_commands):
+            command = available_chrome_commands.pop(0)
+            port_match = re.search(r'--remote-debugging-port=(\d+)', command)
+            if port_match:
+                port = int(port_match.group(1))
+                worker_id = port - 9222 + 1
+                
+                chrome_instance = ChromeInstance(debug_port=port, worker_id=worker_id, chrome_command=command)
+                thread = threading.Thread(
+                    target=worker_process,
+                    args=(chrome_instance, keywords, processed_items, processed_groups, lock, output_dir, available_chrome_commands, active_chrome_instances)
+                )
+                threads.append(thread)
+                thread.start()
+                print(f"Đã khởi động Worker {worker_id} với port {port}")
+                time.sleep(2)  # Delay giữa các lần khởi động Chrome để tránh quá tải
 
+    # Chờ tất cả các threads kết thúc
     for thread in threads:
         thread.join()
 
