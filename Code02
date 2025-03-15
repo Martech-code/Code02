@@ -22,8 +22,12 @@ import math
 import sys
 import subprocess
 import psutil
+import tempfile
+import pandas as pd
+import shutil
+from collections import deque
 
-# Configuration parameters
+# Configuration parameters (CẢ TIẾNG VIỆT VÀ TIẾNG ANH)
 MIN_DELAY_BETWEEN_REQUESTS = 0.5
 MAX_DELAY_BETWEEN_REQUESTS = 1
 MAX_RETRIES = 3
@@ -31,1225 +35,1642 @@ PAGE_LOAD_TIMEOUT = 10
 TAB_SWITCH_DELAY = 0.2
 MAX_TABS = 5
 SCROLL_PAUSE_TIME = 2
-CHROME_INACTIVITY_TIMEOUT = 300  # 5 minutes in seconds
+CHROME_INACTIVITY_TIMEOUT = 300 # 5 minutes in seconds
 # TELEGRAM_TOKEN = "7584627793:AAHPB4zaMSTYgu2P6N9RMlplr0KcFMP1FQQ"
 # TELEGRAM_CHAT_ID = "-1002371940283"
 
 # Quản lý vị trí cửa sổ Chrome
 class WindowPositionManager:
-    def __init__(self):
-        self.lock = threading.Lock()
-        # Giả định màn hình có kích thước 1920x1080
-        self.screen_width = 1920
-        self.screen_height = 1080
-        
-        # Kích thước cho mỗi cửa sổ Chrome
-        self.window_width = self.screen_width // 5  # 5 cửa sổ trên mỗi hàng
-        self.window_height = self.screen_height // 2  # 2 hàng (trên và dưới)
-        
-        # Theo dõi các vị trí đã được sử dụng
-        self.used_positions = {}  # {worker_id: (x, y)}
-        
-        # Tạo danh sách tất cả các vị trí có thể
-        self.available_positions = []
-        for row in range(2):  # 2 hàng
-            for col in range(5):  # 5 cửa sổ mỗi hàng
-                x = col * self.window_width
-                y = row * self.window_height
-                self.available_positions.append((x, y))
-    
-    def get_position(self, worker_id):
-        with self.lock:
-            # Nếu worker_id đã có vị trí, trả về vị trí đó
-            if worker_id in self.used_positions:
-                return self.used_positions[worker_id], self.window_width, self.window_height
-            
-            # Nếu còn vị trí trống, cấp phát vị trí mới
-            if self.available_positions:
-                position = self.available_positions.pop(0)
-                self.used_positions[worker_id] = position
-                return position, self.window_width, self.window_height
-            
-            # Nếu không còn vị trí nào, trả về vị trí mặc định (0,0)
-            return (0, 0), self.window_width, self.window_height
-    
-    def release_position(self, worker_id):
-        with self.lock:
-            if worker_id in self.used_positions:
-                position = self.used_positions.pop(worker_id)
-                self.available_positions.append(position)
+def __init__(self):
+self.lock = threading.Lock()
+# Giả định màn hình có kích thước 1920x1080
+self.screen_width = 1920
+self.screen_height = 1080
+
+# Kích thước cho mỗi cửa sổ Chrome
+self.window_width = self.screen_width // 5 # 5 cửa sổ trên mỗi hàng
+self.window_height = self.screen_height // 2 # 2 hàng (trên và dưới)
+
+# Theo dõi các vị trí đã được sử dụng
+self.used_positions = {} # {worker_id: (x, y)}
+
+# Tạo danh sách tất cả các vị trí có thể
+self.available_positions = []
+for row in range(2): # 2 hàng
+for col in range(5): # 5 cửa sổ mỗi hàng
+x = col * self.window_width
+y = row * self.window_height
+self.available_positions.append((x, y))
+
+def get_position(self, worker_id):
+with self.lock:
+# Nếu worker_id đã có vị trí, trả về vị trí đó
+if worker_id in self.used_positions:
+return self.used_positions[worker_id], self.window_width, self.window_height
+
+# Nếu còn vị trí trống, cấp phát vị trí mới
+if self.available_positions:
+position = self.available_positions.pop(0)
+self.used_positions[worker_id] = position
+return position, self.window_width, self.window_height
+
+# Nếu không còn vị trí nào, trả về vị trí mặc định (0,0)
+return (0, 0), self.window_width, self.window_height
+
+def release_position(self, worker_id):
+with self.lock:
+if worker_id in self.used_positions:
+position = self.used_positions.pop(worker_id)
+self.available_positions.append(position)
 
 # Khởi tạo window position manager
 window_manager = WindowPositionManager()
 
 def calculate_std_dev(values):
-    n = len(values)
-    if n < 2:
-        return 0
-    mean = sum(values) / n
-    squared_diff_sum = sum((x - mean) ** 2 for x in values)
-    return math.sqrt(squared_diff_sum / (n - 1))
+n = len(values)
+if n < 2:
+return 0
+mean = sum(values) / n
+squared_diff_sum = sum((x - mean) ** 2 for x in values)
+return math.sqrt(squared_diff_sum / (n - 1))
 
 class ChromeInstance:
-    def __init__(self, debug_port, worker_id, chrome_command=None):
-        self.debug_port = debug_port
-        self.worker_id = worker_id
-        self.driver = None
-        self.processed_count = 0
-        self.is_checkpoint = False
-        self.is_blocked = False
-        self.processed_groups = set()
-        self.collected_urls = []
-        self.failed_urls = []
-        self.processed_urls = set()
-        self.skipped_urls = []
-        self.chrome_command = chrome_command
-        self.process = None
-        self.last_activity_time = datetime.now()
-        
-    def track_processed_url(self, url):
-        self.processed_urls.add(url)
-        self.update_activity_time()
-        
-    def track_skipped_url(self, url, reason):
-        self.skipped_urls.append({
-            'url': url,
-            'timestamp': datetime.now().isoformat(),
-            'reason': reason
-        })
-        self.update_activity_time()
+def __init__(self, debug_port, worker_id, chrome_command=None):
+self.debug_port = debug_port
+self.worker_id = worker_id
+self.driver = None
+self.processed_count = 0
+self.is_checkpoint = False
+self.is_blocked = False
+self.processed_groups = set()
+self.collected_urls = []
+self.failed_urls = []
+self.processed_urls = set()
+self.skipped_urls = []
+self.chrome_command = chrome_command
+self.process = None
+self.last_activity_time = datetime.now()
+self.is_collecting_urls = False
+self.profile_switch_failed = False
 
-    def update_activity_time(self):
-        self.last_activity_time = datetime.now()
+def cleanup_memory(self):
+"""Dọn dẹp bộ nhớ Chrome để tránh lỗi Out of Memory"""
+try:
+if self.driver:
+# Thực thi garbage collection trong JavaScript
+self.driver.execute_script("if (window.gc) window.gc();")
 
-    def is_inactive(self):
-        inactive_time = (datetime.now() - self.last_activity_time).total_seconds()
-        return inactive_time > CHROME_INACTIVITY_TIMEOUT
+# Đóng các tab không cần thiết
+current_handles = self.driver.window_handles
+if len(current_handles) > 1:
+current_handle = self.driver.current_window_handle
+for handle in current_handles:
+if handle != current_handle:
+self.driver.switch_to.window(handle)
+self.driver.close()
+self.driver.switch_to.window(current_handle)
 
-    def save_progress(self, keyword, urls, current_index, output_dir):
-        progress_file = os.path.join(output_dir, f'progress_worker_{self.worker_id}.json')
-        progress_data = {
-            'keyword': keyword,
-            'urls': urls,
-            'current_index': current_index,
-            'timestamp': datetime.now().isoformat()
-        }
-        try:
-            with open(progress_file, 'w', encoding='utf-8') as f:
-                json.dump(progress_data, f, ensure_ascii=False, indent=2)
-            self.update_activity_time()
-        except Exception as e:
-            print(f"[Worker {self.worker_id}] Lỗi lưu tiến độ: {str(e)}")
+print(f"[Worker {self.worker_id}] Đã dọn dẹp bộ nhớ Chrome")
+return True
+except Exception as e:
+print(f"[Worker {self.worker_id}] Lỗi khi dọn dẹp bộ nhớ: {str(e)}")
+return False
 
-    def load_progress(self, output_dir):
-        progress_file = os.path.join(output_dir, f'progress_worker_{self.worker_id}.json')
-        try:
-            if os.path.exists(progress_file):
-                with open(progress_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception as e:
-            print(f"[Worker {self.worker_id}] Lỗi đọc tiến độ: {str(e)}")
-        return None
+def track_processed_url(self, url):
+self.processed_urls.add(url)
+self.update_activity_time()
 
-    def clear_progress(self, output_dir):
-        progress_file = os.path.join(output_dir, f'progress_worker_{self.worker_id}.json')
-        try:
-            if os.path.exists(progress_file):
-                os.remove(progress_file)
-        except Exception as e:
-            print(f"[Worker {self.worker_id}] Lỗi xóa file tiến độ: {str(e)}")
+def track_skipped_url(self, url, reason):
+self.skipped_urls.append({
+'url': url,
+'timestamp': datetime.now().isoformat(),
+'reason': reason
+})
+self.update_activity_time()
 
-    def setup_chrome_driver(self):
-        chrome_options = Options()
-        chrome_options.add_experimental_option("debuggerAddress", f"127.0.0.1:{self.debug_port}")
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--disable-notifications')
-        chrome_options.add_argument('--disable-infobars')
-        chrome_options.add_argument('--lang=vi')
-        return chrome_options
+def update_activity_time(self):
+self.last_activity_time = datetime.now()
 
-    def start_chrome(self):
-        if self.chrome_command:
-            try:
-                print(f"[Worker {self.worker_id}] Khởi động Chrome port {self.debug_port}")
-                
-                # Lấy thông tin vị trí cửa sổ từ window manager
-                (x, y), width, height = window_manager.get_position(self.worker_id)
-                
-                # Thêm tham số vị trí và kích thước vào lệnh gọi Chrome
-                modified_command = self.chrome_command
-                
-                # Xóa bỏ tham số cũ về vị trí và kích thước nếu có
-                modified_command = re.sub(r'--window-position=\S+', '', modified_command)
-                modified_command = re.sub(r'--window-size=\S+', '', modified_command)
-                
-                # Thêm tham số mới về vị trí và kích thước
-                modified_command = f"{modified_command} --window-position={x},{y} --window-size={width},{height}"
-                
-                self.process = subprocess.Popen(modified_command, shell=True)
-                time.sleep(5)  # Đợi Chrome khởi động
-                return True
-            except Exception as e:
-                print(f"[Worker {self.worker_id}] Lỗi khởi động Chrome: {str(e)}")
-                # Giải phóng vị trí nếu khởi động thất bại
-                window_manager.release_position(self.worker_id)
-                return False
-        return False
+def is_inactive(self):
+inactive_time = (datetime.now() - self.last_activity_time).total_seconds()
+return inactive_time > CHROME_INACTIVITY_TIMEOUT
 
-    def kill_chrome(self):
-        # Giải phóng vị trí cửa sổ trước khi đóng Chrome
-        window_manager.release_position(self.worker_id)
-        
-        if self.driver:
-            try:
-                self.driver.quit()
-            except:
-                pass
-            
-        if self.process:
-            try:
-                self.process.terminate()
-                time.sleep(1)
-                if self.process.poll() is None:
-                    self.process.kill()
-            except:
-                pass
-                
-        # Tìm và kill tất cả các process Chrome có port tương ứng
-        try:
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                if proc.info['name'] and 'chrome' in proc.info['name'].lower():
-                    cmdline = ' '.join(proc.info['cmdline'] or [])
-                    if f"--remote-debugging-port={self.debug_port}" in cmdline:
-                        try:
-                            proc.kill()
-                        except:
-                            pass
-        except:
-            pass
+def save_progress(self, keyword, urls, current_index, output_dir):
+progress_file = os.path.join(output_dir, f'progress_worker_{self.worker_id}.json')
+progress_data = {
+'keyword': keyword,
+'urls': urls,
+'current_index': current_index,
+'timestamp': datetime.now().isoformat()
+}
+try:
+with open(progress_file, 'w', encoding='utf-8') as f:
+json.dump(progress_data, f, ensure_ascii=False, indent=2)
+self.update_activity_time()
+except Exception as e:
+print(f"[Worker {self.worker_id}] Lỗi lưu tiến độ: {str(e)}")
 
-    def create_driver(self):
-        try:
-            options = self.setup_chrome_driver()
-            service = Service()
-            self.driver = webdriver.Chrome(service=service, options=options)
-            self.driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-            self.update_activity_time()
-            return self.driver
-        except Exception as e:
-            raise Exception(f"Lỗi khởi tạo Chrome WebDriver port {self.debug_port}: {str(e)}")
+def load_progress(self, output_dir):
+progress_file = os.path.join(output_dir, f'progress_worker_{self.worker_id}.json')
+try:
+if os.path.exists(progress_file):
+with open(progress_file, 'r', encoding='utf-8') as f:
+return json.load(f)
+except Exception as e:
+print(f"[Worker {self.worker_id}] Lỗi đọc tiến độ: {str(e)}")
+return None
 
-    def close_block_popup(self):
-        try:
-            popup = self.driver.find_element(By.XPATH, "//div[contains(@class, 'x1ey2m1c') and contains(@class, 'xds687c') and contains(@class, 'x17qophe') and contains(@class, 'xg01cxk') and contains(@class, 'x47corl') and contains(@class, 'x10l6tqk') and contains(@class, 'x13vifvy') and contains(@class, 'x1ebt8du') and contains(@class, 'x19991ni') and contains(@class, 'x1dhq9h') and contains(@class, 'xzolkzo') and contains(@class, 'x12go9s9') and contains(@class, 'x1rnf11y') and contains(@class, 'xprq8jg')]")
-            actions = ActionChains(self.driver)
-            actions.double_click(popup).perform()
-            time.sleep(1)
-            self.update_activity_time()
-            return True
-        except:
-            return False
+def clear_progress(self, output_dir):
+progress_file = os.path.join(output_dir, f'progress_worker_{self.worker_id}.json')
+try:
+if os.path.exists(progress_file):
+os.remove(progress_file)
+except Exception as e:
+print(f"[Worker {self.worker_id}] Lỗi xóa file tiến độ: {str(e)}")
 
-    def check_checkpoint(self):
-        try:
-            current_url = self.driver.current_url.lower()
-            checkpoint_indicators = [
-                "facebook.com/checkpoint",
-                "facebook.com/recover",
-                "facebook.com/login",
-                "/login/?next",
-                "checkpoint/?next"
-            ]
-            return any(indicator in current_url for indicator in checkpoint_indicators)
-        except:
-            return False
+def setup_chrome_driver(self):
+chrome_options = Options()
+chrome_options.add_experimental_option("debuggerAddress", f"127.0.0.1:{self.debug_port}")
+chrome_options.add_argument('--no-sandbox')
+chrome_options.add_argument('--disable-dev-shm-usage')
+chrome_options.add_argument('--disable-gpu')
+chrome_options.add_argument('--disable-notifications')
+chrome_options.add_argument('--disable-infobars')
+chrome_options.add_argument('--lang=vi')
+chrome_options.add_argument('--js-flags=--expose-gc')
+chrome_options.add_argument('--disable-extensions')
+chrome_options.add_argument('--disable-plugins')
+chrome_options.add_argument('--disable-popup-blocking')
+chrome_options.add_argument('--disable-default-apps')
+chrome_options.add_argument('--disable-translate')
+chrome_options.add_argument('--disable-sync')
+chrome_options.add_argument('--process-per-site')
+chrome_options.add_argument('--disk-cache-size=1')
+chrome_options.add_argument('--media-cache-size=1')
+return chrome_options
 
-    def check_blocked(self):
-        try:
-            blocked_text = "Bạn tạm thời bị chặn"
-            blocked_text_2 = "Có vẻ như bạn đang dùng nhầm tính năng này do sử dụng quá nhanh"
-            page_source = self.driver.page_source
-            return blocked_text in page_source or blocked_text_2 in page_source
-        except:
-            return False
-            
-    def check_logout(self):
-        try:
-            # Kiểm tra tiêu đề tab
-            current_title = self.driver.title
-            if "Page not found" in current_title:
-                print(f"[Worker {self.worker_id}] Phát hiện 'Page not found' trong tiêu đề, có thể đã bị logout")
-                return True
-                
-            # Kiểm tra nội dung trang
-            if "Page not found" in self.driver.page_source:
-                print(f"[Worker {self.worker_id}] Phát hiện 'Page not found' trong nội dung trang, có thể đã bị logout")
-                return True
-                
-            # Kiểm tra URL đăng nhập
-            current_url = self.driver.current_url.lower()
-            login_indicators = [
-                "facebook.com/login",
-                "/login/?next"
-            ]
-            if any(indicator in current_url for indicator in login_indicators):
-                print(f"[Worker {self.worker_id}] Phát hiện URL đăng nhập, đã bị logout")
-                return True
-                
-            return False
-        except Exception as e:
-            print(f"[Worker {self.worker_id}] Lỗi khi kiểm tra logout: {str(e)}")
-            return False
+def start_chrome(self):
+if self.chrome_command:
+try:
+print(f"[Worker {self.worker_id}] Khởi động Chrome port {self.debug_port}")
 
-    def check_suspicious(self):
-        try:
-            # Theo dõi URL hiện tại
-            current_url = self.driver.current_url.lower()
-            
-            # Nếu URL chứa checkpoint suspicious
-            if "facebook.com/checkpoint/601051028565049" in current_url:
-                # Tìm nút "Bỏ qua" hoặc "Dismiss"
-                skip_button = self.driver.find_elements(By.XPATH, "//span[contains(@class, 'x1lliihq') and contains(@class, 'x6ikm8r') and contains(@class, 'x10wlt62') and contains(@class, 'x1n2onr6') and contains(@class, 'xlyipyv') and contains(@class, 'xuxw1ft') and (contains(text(), 'Bỏ qua') or contains(text(), 'Dismiss'))]")
-                
-                if skip_button:
-                    try:
-                        actions = ActionChains(self.driver)
-                        actions.double_click(skip_button[0]).perform()
-                        print(f"[Worker {self.worker_id}] Đã click nút Bỏ qua trên trang Checkpoint")
-                        time.sleep(1)
-                        self.update_activity_time()
-                        return True
-                    except Exception as e:
-                        print(f"[Worker {self.worker_id}] Lỗi khi click nút Bỏ qua: {str(e)}")
-                        return False
-            return False
-        except Exception as e:
-            print(f"[Worker {self.worker_id}] Lỗi khi kiểm tra trang suspicious: {str(e)}")
-            return False
+# Lấy thông tin vị trí cửa sổ từ window manager
+(x, y), width, height = window_manager.get_position(self.worker_id)
 
-    # Thêm hàm mới để theo dõi URL
-    def url_monitor(self):
-        """Hàm theo dõi URL và xử lý checkpoint"""
-        try:
-            current_url = self.driver.current_url
-            if "facebook.com/checkpoint/601051028565049" in current_url.lower():
-                self.check_suspicious()
-                self.update_activity_time()
-        except Exception as e:
-            print(f"[Worker {self.worker_id}] Lỗi khi theo dõi URL: {str(e)}")
+# Thêm tham số vị trí và kích thước vào lệnh gọi Chrome
+modified_command = self.chrome_command
 
-    def scroll_and_collect_groups(self):
-        print(f"[Worker {self.worker_id}] Bắt đầu scroll và thu thập URLs...")
-        group_links = []  # Đổi từ set sang list để duy trì thứ tự
-        group_links_set = set()  # Dùng set để kiểm tra trùng lặp
-        no_new_content_count = 0
-        previous_unique_count = 0
-        last_height = self.driver.execute_script("return document.documentElement.scrollHeight")
-        
-        # Kiểm tra logout trước khi bắt đầu thu thập
-        if self.check_logout():
-            print(f"[Worker {self.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
-            return group_links
-        
-        while True:
-            current_height = self.driver.execute_script("return window.pageYOffset")
-            target_height = min(current_height + 300, last_height)
-            self.driver.execute_script(f"window.scrollTo(0, {target_height});")
-            time.sleep(0.3)
+# Xóa bỏ tham số cũ về vị trí và kích thước nếu có
+modified_command = re.sub(r'--window-position=\S+', '', modified_command)
+modified_command = re.sub(r'--window-size=\S+', '', modified_command)
 
-            time.sleep(SCROLL_PAUSE_TIME)
-            
-            # Kiểm tra logout sau mỗi lần scroll
-            if self.check_logout():
-                print(f"[Worker {self.worker_id}] Phát hiện Chrome đã logout, dừng thu thập URLs")
-                break
-            
-            actual_height = self.driver.execute_script("return window.pageYOffset")
-            if abs(actual_height - target_height) > 50:
-                self.driver.execute_script(f"window.scrollTo(0, {target_height});")
-                time.sleep(0.3)
+# Thêm tham số mới về vị trí và kích thước
+modified_command = f"{modified_command} --window-position={x},{y} --window-size={width},{height}"
 
-            elements = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='/groups/']")
-            
-            new_urls_added = 0
-            for element in elements:
-                try:
-                    href = element.get_attribute('href')
-                    if href and re.search(r'facebook\.com/groups/\d+/?$', href):
-                        clean_url = re.sub(r'\?.*$', '', href)
-                        if clean_url not in self.processed_groups and clean_url not in group_links_set:
-                            group_links.append(clean_url)  # Thêm vào list để giữ thứ tự
-                            group_links_set.add(clean_url)  # Thêm vào set để kiểm tra trùng lặp
-                            new_urls_added += 1
-                except:
-                    continue
-            
-            current_unique_count = len(group_links)
-            print(f"[Worker {self.worker_id}] Đã tìm thấy {new_urls_added} nhóm mới (Tổng: {current_unique_count} nhóm độc nhất)")
-            
-            if current_unique_count == previous_unique_count:
-                no_new_content_count += 1
-                print(f"[Worker {self.worker_id}] Không tìm thấy nhóm mới... ({no_new_content_count}/8)")
-                
-                # Kiểm tra popup khi no_new_content_count = 6
-                if no_new_content_count == 6:
-                    print(f"[Worker {self.worker_id}] Kiểm tra và xử lý popup tại lần thứ 6...")
-                    if self.close_block_popup():
-                        print(f"[Worker {self.worker_id}] Đã đóng popup block, tiếp tục thu thập...")
-                        time.sleep(1)
-                        continue  # Bỏ qua phần còn lại và tiếp tục vòng lặp
-                
-                if no_new_content_count >= 8:
-                    print(f"[Worker {self.worker_id}] Hoàn tất thu thập URLs sau 8 lần không có nhóm mới")
-                    break
-            else:
-                no_new_content_count = 0
-                previous_unique_count = current_unique_count
+self.process = subprocess.Popen(modified_command, shell=True)
+time.sleep(5) # Đợi Chrome khởi động
+return True
+except Exception as e:
+print(f"[Worker {self.worker_id}] Lỗi khởi động Chrome: {str(e)}")
+# Giải phóng vị trí nếu khởi động thất bại
+window_manager.release_position(self.worker_id)
+return False
+return False
 
-            new_height = self.driver.execute_script("return document.documentElement.scrollHeight")
-            if new_height != last_height:
-                last_height = new_height
-                no_new_content_count = 0
-            elif abs(actual_height - last_height) < 100:
-                time.sleep(SCROLL_PAUSE_TIME * 2)
-                if abs(actual_height - self.driver.execute_script("return document.documentElement.scrollHeight")) < 100:
-                    print(f"[Worker {self.worker_id}] Đã đến cuối trang")
-                    break
+def kill_chrome(self):
+# Giải phóng vị trí cửa sổ trước khi đóng Chrome
+window_manager.release_position(self.worker_id)
 
-        print(f"[Worker {self.worker_id}] Tổng cộng đã thu thập được {len(group_links)} URLs độc nhất")
-        self.update_activity_time()
-        return group_links  # Trả về list thay vì set
+if self.driver:
+try:
+self.driver.quit()
+except:
+pass
+
+if self.process:
+try:
+self.process.terminate()
+time.sleep(1)
+if self.process.poll() is None:
+self.process.kill()
+except:
+pass
+
+# Tìm và kill tất cả các process Chrome có port tương ứng
+try:
+for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+if proc.info['name'] and 'chrome' in proc.info['name'].lower():
+cmdline = ' '.join(proc.info['cmdline'] or [])
+if f"--remote-debugging-port={self.debug_port}" in cmdline:
+try:
+proc.kill()
+except:
+pass
+except:
+pass
+
+def create_driver(self):
+try:
+options = self.setup_chrome_driver()
+service = Service()
+self.driver = webdriver.Chrome(service=service, options=options)
+self.driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+self.update_activity_time()
+return self.driver
+except Exception as e:
+raise Exception(f"Lỗi khởi tạo Chrome WebDriver port {self.debug_port}: {str(e)}")
+
+def close_block_popup(self):
+try:
+popup = self.driver.find_element(By.XPATH, "//div[contains(@class, 'x1ey2m1c') and contains(@class, 'xds687c') and contains(@class, 'x17qophe') and contains(@class, 'xg01cxk') and contains(@class, 'x47corl') and contains(@class, 'x10l6tqk') and contains(@class, 'x13vifvy') and contains(@class, 'x1ebt8du') and contains(@class, 'x19991ni') and contains(@class, 'x1dhq9h') and contains(@class, 'xzolkzo') and contains(@class, 'x12go9s9') and contains(@class, 'x1rnf11y') and contains(@class, 'xprq8jg')]")
+actions = ActionChains(self.driver)
+actions.double_click(popup).perform()
+time.sleep(1)
+self.update_activity_time()
+return True
+except:
+return False
+
+def switch_to_profile_page(self):
+"""Chuyển đổi sang page profile trước khi tìm kiếm"""
+try:
+print(f"[Worker {self.worker_id}] Đang kiểm tra trạng thái profile...")
+
+# Đảm bảo đang ở trang chủ Facebook
+self.driver.get("https://www.facebook.com/")
+time.sleep(5) # Tăng thời gian chờ để trang load đầy đủ
+self.update_activity_time()
+
+# Kiểm tra xem đã ở trang profile chưa bằng cách tìm phần tử story (cả tiếng Anh và tiếng Việt)
+try:
+# Tìm phần tử story - nếu tìm thấy thì đang ở trang chủ, cần chuyển sang profile
+story_selectors = [
+"//div[@aria-label='stories tray']", # Tiếng Anh
+"//div[@aria-label='khay tin']", # Tiếng Việt
+]
+
+story_found = False
+for selector in story_selectors:
+story_element = self.driver.find_elements(By.XPATH, selector)
+if story_element:
+story_found = True
+break
+
+if not story_found:
+print(f"[Worker {self.worker_id}] Đã ở trang profile, không cần chuyển đổi")
+return True
+
+print(f"[Worker {self.worker_id}] Đang ở trang chủ, cần chuyển sang page profile...")
+
+# Click vào avatar để mở menu
+# 1. Tìm avatar ở góc trên bên phải
+avatar_found = False
+
+try:
+# Tìm avatar bằng XPath cụ thể - tìm thẻ div có role="button" chứa thẻ svg
+avatar_selector = "//div[@role='button' and contains(@aria-label, 'profile') or contains(@aria-label, 'Trang cá nhân')]"
+avatar_element = WebDriverWait(self.driver, 5).until(
+EC.element_to_be_clickable((By.XPATH, avatar_selector))
+)
+
+# Click bằng JavaScript để đảm bảo
+self.driver.execute_script("arguments[0].click();", avatar_element)
+print(f"[Worker {self.worker_id}] Đã click vào avatar profile")
+avatar_found = True
+time.sleep(3) # Đợi menu hiện ra
+self.update_activity_time()
+except Exception as e:
+print(f"[Worker {self.worker_id}] Không tìm thấy avatar với selector cụ thể: {str(e)}")
+
+# Nếu không tìm thấy bằng selector cụ thể, thử phương pháp khác
+if not avatar_found:
+try:
+# Tìm thẻ div có chứa hình ảnh avatar ở góc trên bên phải
+avatar_elements = self.driver.find_elements(By.XPATH, "//div[contains(@class, 'x1rg5ohu') and contains(@class, 'x1n2onr6') and contains(@class, 'x3ajldb')]")
+if avatar_elements and len(avatar_elements) > 0:
+# Click vào phần tử cuối cùng (thường là avatar ở góc trên bên phải)
+self.driver.execute_script("arguments[0].click();", avatar_elements[-1])
+print(f"[Worker {self.worker_id}] Đã click vào avatar profile bằng class")
+avatar_found = True
+time.sleep(3) # Đợi menu hiện ra
+self.update_activity_time()
+except Exception as e:
+print(f"[Worker {self.worker_id}] Không tìm thấy avatar bằng class: {str(e)}")
+
+# Nếu vẫn không tìm thấy, thử click vào góc trên bên phải
+if not avatar_found:
+try:
+# Click vào vị trí cố định trên màn hình (góc trên bên phải)
+action = ActionChains(self.driver)
+action.move_by_offset(self.driver.execute_script("return window.innerWidth") - 50, 40)
+action.click().perform()
+print(f"[Worker {self.worker_id}] Đã click vào vị trí avatar bằng tọa độ")
+time.sleep(3)
+avatar_found = True
+except Exception as e:
+print(f"[Worker {self.worker_id}] Không thể click bằng tọa độ: {str(e)}")
+
+if not avatar_found:
+print(f"[Worker {self.worker_id}] Không tìm thấy avatar profile")
+self.profile_switch_failed = True # Đặt cờ thất bại
+self.kill_chrome()
+return False
+
+# Click vào mục chuyển sang page profile trong dropdown menu
+try:
+# Tìm phần tử có role="listitem" và chứa "Chuyển sang" hoặc "Switch to"
+page_selector = "//div[@role='listitem']//div[contains(@aria-label, 'Chuyển sang') or contains(@aria-label, 'Switch to')]"
+page_elements = WebDriverWait(self.driver, 5).until(
+EC.presence_of_all_elements_located((By.XPATH, page_selector))
+)
+
+if page_elements and len(page_elements) > 0:
+# Click vào phần tử đầu tiên
+self.driver.execute_script("arguments[0].click();", page_elements[0])
+print(f"[Worker {self.worker_id}] Đã click vào 'Chuyển sang page profile'")
+time.sleep(4)
+self.update_activity_time()
+
+# Kiểm tra xem đã chuyển sang page profile chưa
+story_found = False
+for selector in story_selectors:
+if self.driver.find_elements(By.XPATH, selector):
+story_found = True
+break
+
+if story_found:
+print(f"[Worker {self.worker_id}] Vẫn ở trang chủ sau khi click, không thể chuyển sang page profile")
+self.profile_switch_failed = True
+self.kill_chrome()
+return False
+
+return True
+else:
+print(f"[Worker {self.worker_id}] Không tìm thấy liên kết 'Chuyển sang page profile'")
+self.profile_switch_failed = True # Đặt cờ thất bại
+self.kill_chrome()
+return False
+
+except Exception as e:
+print(f"[Worker {self.worker_id}] Không thể chuyển sang page profile: {str(e)}")
+self.profile_switch_failed = True # Đặt cờ thất bại
+self.kill_chrome()
+return False
+
+except Exception as e:
+print(f"[Worker {self.worker_id}] Lỗi khi kiểm tra trạng thái profile: {str(e)}")
+self.profile_switch_failed = True # Đặt cờ thất bại
+self.kill_chrome()
+return False
+
+except Exception as e:
+print(f"[Worker {self.worker_id}] Lỗi khi chuyển đổi sang page profile: {str(e)}")
+self.profile_switch_failed = True # Đặt cờ thất bại
+self.kill_chrome()
+return False
+
+def check_checkpoint(self):
+try:
+current_url = self.driver.current_url.lower()
+checkpoint_indicators = [
+"facebook.com/checkpoint",
+"facebook.com/recover",
+"facebook.com/login",
+"/login/?next",
+"checkpoint/?next"
+]
+return any(indicator in current_url for indicator in checkpoint_indicators)
+except:
+return False
+
+def check_blocked(self):
+try:
+blocked_text = "Bạn tạm thời bị chặn"
+blocked_text_2 = "Có vẻ như bạn đang dùng nhầm tính năng này do sử dụng quá nhanh"
+page_source = self.driver.page_source
+return blocked_text in page_source or blocked_text_2 in page_source
+except:
+return False
+
+def check_logout(self):
+try:
+# Kiểm tra tiêu đề tab
+try:
+current_title = self.driver.title
+if "Page Not Found" in current_title:
+print(f"[Worker {self.worker_id}] Phát hiện 'Page Not Found' trong tiêu đề, đã bị logout")
+# Thay vì thêm vào blacklist, chỉ đóng Chrome instance
+self.kill_chrome()
+return True
+except Exception as e:
+if "timeout" in str(e).lower() or "timed out" in str(e).lower():
+print(f"[Worker {self.worker_id}] Timeout khi kiểm tra tiêu đề, cần khởi động lại Chrome")
+self.kill_chrome()
+return True
+
+# Kiểm tra URL đăng nhập
+current_url = self.driver.current_url.lower()
+login_indicators = [
+"facebook.com/login",
+"/login/?next"
+]
+if any(indicator in current_url for indicator in login_indicators):
+print(f"[Worker {self.worker_id}] Phát hiện URL đăng nhập, đã bị logout")
+# Thay vì thêm vào blacklist, chỉ đóng Chrome instance
+self.kill_chrome()
+return True
+
+return False
+except Exception as e:
+print(f"[Worker {self.worker_id}] Lỗi khi kiểm tra logout: {str(e)}")
+return False
+
+def check_suspicious(self):
+try:
+# Theo dõi URL hiện tại
+current_url = self.driver.current_url.lower()
+
+# Nếu URL chứa checkpoint suspicious
+if "facebook.com/checkpoint/601051028565049" in current_url:
+# Tìm nút "Bỏ qua" hoặc "Dismiss"
+skip_button = self.driver.find_elements(By.XPATH, "//span[contains(@class, 'x1lliihq') and contains(@class, 'x6ikm8r') and contains(@class, 'x10wlt62') and contains(@class, 'x1n2onr6') and contains(@class, 'xlyipyv') and contains(@class, 'xuxw1ft') and (contains(text(), 'Bỏ qua') or contains(text(), 'Dismiss'))]")
+
+if skip_button:
+try:
+actions = ActionChains(self.driver)
+actions.double_click(skip_button[0]).perform()
+print(f"[Worker {self.worker_id}] Đã click nút Bỏ qua trên trang Checkpoint")
+time.sleep(1)
+self.update_activity_time()
+return True
+except Exception as e:
+print(f"[Worker {self.worker_id}] Lỗi khi click nút Bỏ qua: {str(e)}")
+return False
+return False
+except Exception as e:
+print(f"[Worker {self.worker_id}] Lỗi khi kiểm tra trang suspicious: {str(e)}")
+return False
+
+# Thêm hàm mới để theo dõi URL
+def url_monitor(self):
+"""Hàm theo dõi URL và xử lý checkpoint"""
+try:
+current_url = self.driver.current_url
+if "facebook.com/checkpoint/601051028565049" in current_url.lower():
+self.check_suspicious()
+self.update_activity_time()
+except Exception as e:
+print(f"[Worker {self.worker_id}] Lỗi khi theo dõi URL: {str(e)}")
+
+def check_timeout_errors(self):
+"""Kiểm tra xem Chrome có bị lỗi timeout không"""
+try:
+# Thử thực hiện một hành động đơn giản để kiểm tra xem Chrome có phản hồi không
+self.driver.execute_script("return navigator.userAgent")
+return False # Chrome vẫn phản hồi bình thường
+except Exception as e:
+error_message = str(e).lower()
+# Kiểm tra các thông báo lỗi liên quan đến timeout
+if any(keyword in error_message for keyword in ["timeout", "timed out", "no such window", "out of memory"]):
+print(f"[Worker {self.worker_id}] Phát hiện Chrome bị lỗi timeout/out of memory, cần khởi động lại")
+self.kill_chrome()
+return True
+return False
+
+def scroll_and_collect_groups(self):
+print(f"[Worker {self.worker_id}] Bắt đầu scroll và thu thập URLs...")
+group_links = [] # Đổi từ set sang list để duy trì thứ tự
+group_links_set = set() # Dùng set để kiểm tra trùng lặp
+no_new_content_count = 0
+previous_unique_count = 0
+last_height = self.driver.execute_script("return document.documentElement.scrollHeight")
+
+# Lưu trạng thái đang thu thập URL
+self.is_collecting_urls = True
+
+try:
+
+# Kiểm tra timeout trước khi bắt đầu thu thập
+try:
+last_height = self.driver.execute_script("return document.documentElement.scrollHeight")
+except Exception as e:
+if "timeout" in str(e).lower() or "timed out" in str(e).lower():
+print(f"[Worker {self.worker_id}] Chrome bị timeout trước khi thu thập URL, dừng thu thập")
+return group_links
+raise e
+
+# Kiểm tra logout trước khi bắt đầu thu thập
+if self.check_logout():
+print(f"[Worker {self.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
+return group_links
+
+while True:
+current_height = self.driver.execute_script("return window.pageYOffset")
+target_height = min(current_height + 300, last_height)
+self.driver.execute_script(f"window.scrollTo(0, {target_height});")
+time.sleep(0.3)
+
+time.sleep(SCROLL_PAUSE_TIME)
+
+# Kiểm tra logout sau mỗi lần scroll nhưng không đóng Chrome ngay
+if self.check_logout():
+print(f"[Worker {self.worker_id}] Phát hiện Chrome đã logout, dừng thu thập URLs")
+break
+
+actual_height = self.driver.execute_script("return window.pageYOffset")
+if abs(actual_height - target_height) > 50:
+self.driver.execute_script(f"window.scrollTo(0, {target_height});")
+time.sleep(0.3)
+
+elements = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='/groups/']")
+
+new_urls_added = 0
+for element in elements:
+try:
+href = element.get_attribute('href')
+if href and re.search(r'facebook\.com/groups/\d+/?$', href):
+clean_url = re.sub(r'\?.*$', '', href)
+if clean_url not in self.processed_groups and clean_url not in group_links_set:
+group_links.append(clean_url) # Thêm vào list để giữ thứ tự
+group_links_set.add(clean_url) # Thêm vào set để kiểm tra trùng lặp
+new_urls_added += 1
+except:
+continue
+
+current_unique_count = len(group_links)
+print(f"[Worker {self.worker_id}] Đã tìm thấy {new_urls_added} nhóm mới (Tổng: {current_unique_count} nhóm độc nhất)")
+
+if current_unique_count == previous_unique_count:
+no_new_content_count += 1
+print(f"[Worker {self.worker_id}] Không tìm thấy nhóm mới... ({no_new_content_count}/8)")
+
+# Kiểm tra popup khi no_new_content_count = 6
+if no_new_content_count == 6:
+print(f"[Worker {self.worker_id}] Kiểm tra và xử lý popup tại lần thứ 6...")
+if self.close_block_popup():
+print(f"[Worker {self.worker_id}] Đã đóng popup block, tiếp tục thu thập...")
+time.sleep(1)
+continue # Bỏ qua phần còn lại và tiếp tục vòng lặp
+
+if no_new_content_count >= 8:
+print(f"[Worker {self.worker_id}] Hoàn tất thu thập URLs sau 8 lần không có nhóm mới")
+break
+else:
+no_new_content_count = 0
+previous_unique_count = current_unique_count
+
+new_height = self.driver.execute_script("return document.documentElement.scrollHeight")
+if new_height != last_height:
+last_height = new_height
+no_new_content_count = 0
+elif abs(actual_height - last_height) < 100:
+time.sleep(SCROLL_PAUSE_TIME * 2)
+if abs(actual_height - self.driver.execute_script("return document.documentElement.scrollHeight")) < 100:
+print(f"[Worker {self.worker_id}] Đã đến cuối trang")
+break
+finally:
+# Đánh dấu đã hoàn thành thu thập URL
+self.is_collecting_urls = False
+
+print(f"[Worker {self.worker_id}] Tổng cộng đã thu thập được {len(group_links)} URLs độc nhất")
+self.update_activity_time()
+return group_links # Trả về list thay vì set
 
 def load_chrome_commands(file_path):
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            commands = [line.strip() for line in f.readlines() if line.strip()]
-        return commands
-    except Exception as e:
-        print(f"Lỗi khi đọc file chrome_commands.txt: {str(e)}")
-        return []
+try:
+with open(file_path, 'r', encoding='utf-8') as f:
+commands = [line.strip() for line in f.readlines() if line.strip()]
+return commands
+except Exception as e:
+print(f"Lỗi khi đọc file chrome_commands.txt: {str(e)}")
+return []
 
 def save_group_urls(urls, keyword, output_dir, worker_id):
-    file_path = os.path.join(output_dir, f'collected_urls_worker_{worker_id}.json')
-    data = {
-        'keyword': keyword,
-        'timestamp': datetime.now().isoformat(),
-        'urls': urls,
-        'total_urls': len(urls)
-    }
+file_path = os.path.join(output_dir, f'collected_urls_worker_{worker_id}.json')
+data = {
+'keyword': keyword,
+'timestamp': datetime.now().isoformat(),
+'urls': urls,
+'total_urls': len(urls)
+}
 
-    try:
-        existing_data = []
-        if os.path.exists(file_path):
-            with open(file_path, 'r', encoding='utf-8') as f:
-                try:
-                    existing_data = json.load(f)
-                    if not isinstance(existing_data, list):
-                        existing_data = [existing_data]
-                except json.JSONDecodeError:
-                    existing_data = []
-        
-        # Tạo set của URLs đã tồn tại
-        existing_urls = set()
-        for entry in existing_data:
-            existing_urls.update(entry.get('urls', []))
-        
-        # Lọc URLs mới và giữ nguyên thứ tự
-        new_urls = [url for url in urls if url not in existing_urls]
-        if new_urls:
-            data['urls'] = new_urls
-            data['total_urls'] = len(new_urls)
-            existing_data.append(data)
-            
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(existing_data, f, ensure_ascii=False, indent=2)
-            print(f"[Worker {worker_id}] Đã lưu {len(new_urls)} URLs mới vào file")
-        else:
-            print(f"[Worker {worker_id}] Không có URLs mới để lưu")
-            
-    except Exception as e:
-        print(f"Error saving URLs to JSON: {str(e)}")
+try:
+existing_data = []
+if os.path.exists(file_path):
+with open(file_path, 'r', encoding='utf-8') as f:
+try:
+existing_data = json.load(f)
+if not isinstance(existing_data, list):
+existing_data = [existing_data]
+except json.JSONDecodeError:
+existing_data = []
+
+# Tạo set của URLs đã tồn tại
+existing_urls = set()
+for entry in existing_data:
+existing_urls.update(entry.get('urls', []))
+
+# Lọc URLs mới và giữ nguyên thứ tự
+new_urls = [url for url in urls if url not in existing_urls]
+if new_urls:
+data['urls'] = new_urls
+data['total_urls'] = len(new_urls)
+existing_data.append(data)
+
+with open(file_path, 'w', encoding='utf-8') as f:
+json.dump(existing_data, f, ensure_ascii=False, indent=2)
+print(f"[Worker {worker_id}] Đã lưu {len(new_urls)} URLs mới vào file")
+else:
+print(f"[Worker {worker_id}] Không có URLs mới để lưu")
+
+except Exception as e:
+print(f"Error saving URLs to JSON: {str(e)}")
 
 def save_failed_urls(failed_urls, output_dir, worker_id):
-    file_path = os.path.join(output_dir, f'failed_urls_worker_{worker_id}.json')
-    try:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump({
-                'failed_urls': failed_urls,
-                'total_failed': len(failed_urls),
-                'timestamp': datetime.now().isoformat()
-            }, f, ensure_ascii=False, indent=2)
-        print(f"[Worker {worker_id}] Đã lưu {len(failed_urls)} URLs thất bại vào file")
-    except Exception as e:
-        print(f"Error saving failed URLs: {str(e)}")
+file_path = os.path.join(output_dir, f'failed_urls_worker_{worker_id}.json')
+try:
+with open(file_path, 'w', encoding='utf-8') as f:
+json.dump({
+'failed_urls': failed_urls,
+'total_failed': len(failed_urls),
+'timestamp': datetime.now().isoformat()
+}, f, ensure_ascii=False, indent=2)
+print(f"[Worker {worker_id}] Đã lưu {len(failed_urls)} URLs thất bại vào file")
+except Exception as e:
+print(f"Error saving failed URLs: {str(e)}")
 
 def convert_members_count(count_text):
-    try:
-        # Remove "thành viên", "members" text and whitespace
-        count_text = count_text.lower().replace('thành viên', '').replace('members', '').replace(' ', '').strip()
-        
-        # Standardize decimal separator to dot
-        if ',' in count_text:
-            count_text = count_text.replace(',', '.')
-        
-        # Handle "triệu" (Vietnamese millions)
-        if 'triệu' in count_text:
-            number = float(count_text.replace('triệu', ''))
-            return int(number * 1000000)
-        
-        # Handle K (thousands)
-        if 'k' in count_text:
-            number = float(count_text.replace('k', ''))
-            return int(number * 1000)
-        
-        # Handle M (millions) 
-        if 'm' in count_text:
-            number = float(count_text.replace('m', ''))
-            return int(number * 1000000)
-            
-        # Handle B (billions)
-        if 'b' in count_text:
-            number = float(count_text.replace('b', ''))
-            return int(number * 1000000000)
-            
-        # Handle regular numbers
-        return int(float(count_text))
-    except:
-        return 0
+try:
+# Remove "thành viên", "members" text and whitespace
+count_text = count_text.lower().replace('thành viên', '').replace('members', '').replace(' ', '').strip()
 
-def process_single_group(chrome_instance, group_url, search_keywords, output_file, lock, retry_count=0):
-    print(f"[Worker {chrome_instance.worker_id}] Đang xử lý nhóm: {group_url}")
-    try:
-        chrome_instance.driver.get(group_url)
-        chrome_instance.url_monitor()
-        chrome_instance.update_activity_time()
-        
-        time.sleep(random.uniform(2, 3))
-        
-        # Kiểm tra logout
-        if chrome_instance.check_logout():
-            print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
-            chrome_instance.kill_chrome()
-            return False
+# Standardize decimal separator to dot
+if ',' in count_text:
+count_text = count_text.replace(',', '.')
 
-        def handle_popup():
-            """Xử lý popup block"""
-            if chrome_instance.close_block_popup():
-                print(f"[Worker {chrome_instance.worker_id}] Đã đóng popup block")
-                time.sleep(random.uniform(1, 2))
-                return True
-            return False
+# Handle "triệu" (Vietnamese millions)
+if 'triệu' in count_text:
+number = float(count_text.replace('triệu', ''))
+return int(number * 1000000)
 
-        # Check popup sau khi load trang
-        time.sleep(1)
-        handle_popup()
+# Handle K (thousands)
+if 'k' in count_text:
+number = float(count_text.replace('k', ''))
+return int(number * 1000)
 
-        if "content not found" in chrome_instance.driver.page_source.lower() or "không tìm thấy nội dung" in chrome_instance.driver.page_source.lower():
-            if retry_count < MAX_RETRIES:
-                time.sleep(random.uniform(1, 3))
-                return process_single_group(chrome_instance, group_url, search_keywords, output_file, lock, retry_count + 1)
-            else:
-                raise Exception("Không thể tải trang sau nhiều lần thử")
+# Handle M (millions)
+if 'm' in count_text:
+number = float(count_text.replace('m', ''))
+return int(number * 1000000)
 
-        try:
-            group_name_element = WebDriverWait(chrome_instance.driver, 2).until(
-                EC.presence_of_element_located((By.XPATH, "//h1//a[contains(@class, 'x16tdsg8')]"))
-            )
-            group_name = group_name_element.text.strip()
-        except:
-            if retry_count < MAX_RETRIES:
-                time.sleep(random.uniform(1, 2))
-                return process_single_group(chrome_instance, group_url, search_keywords, output_file, lock, retry_count + 1)
-            else:
-                raise Exception("Không thể lấy tên nhóm")
+# Handle B (billions)
+if 'b' in count_text:
+number = float(count_text.replace('b', ''))
+return int(number * 1000000000)
 
-        try:
-            group_type_element = WebDriverWait(chrome_instance.driver, 1).until(
-                EC.presence_of_element_located((By.XPATH, "//div[contains(text(), 'Nhóm') and contains(@class, 'x1n2onr6')]"))
-            )
-            group_type = group_type_element.text.strip()
-        except:
-            group_type = "Unknown"
+# Handle regular numbers
+return int(float(count_text))
+except:
+return 0
 
-        try:
-            members_element = WebDriverWait(chrome_instance.driver, 1).until(
-                EC.presence_of_element_located((By.XPATH, "//a[contains(@href, '/members/')]"))
-            )
-            members_text = members_element.text
-            members_match = re.search(r'([\d,\.]+[KMB]?) thành viên', members_text)
-            members_count = members_match.group(1) if members_match else "0"
-        except:
-            if retry_count < MAX_RETRIES:
-                time.sleep(random.uniform(1, 2))
-                return process_single_group(chrome_instance, group_url, search_keywords, output_file, lock, retry_count + 1)
-            else:
-                members_count = "0"
+def check_url_exists_in_csv(url, csv_file):
+try:
+if not os.path.exists(csv_file):
+return False
 
-        numeric_members_count = convert_members_count(members_count)
+# Chuẩn hóa URL để so sánh chính xác hơn
+normalized_url = url.strip().lower().replace('https://www.', '').replace('http://www.', '')
 
-        # Kiểm tra nếu không lấy được group_type và members_count
-        if group_type == "Unknown" and members_count == "0":
-            chrome_instance.failed_urls.append({
-                'url': group_url,
-                'error': "Không thể lấy group_type và members_count",
-                'timestamp': datetime.now().isoformat()
-            })
-            return True
+# Đọc file CSV để kiểm tra URL đã tồn tại chưa
+with open(csv_file, 'r', encoding='utf-8-sig') as f:
+for line in f:
+if normalized_url in line.lower():
+return True
+return False
+except Exception as e:
+print(f"Lỗi khi kiểm tra URL trong CSV: {str(e)}")
+# Nếu có lỗi, trả về False để xử lý URL này
+return False
 
-        try:
-            can_post = "No"
-            try:
-                post_box_vn = WebDriverWait(chrome_instance.driver, 2).until(
-                    EC.presence_of_element_located((By.XPATH, '//span[@class="x1lliihq x6ikm8r x10wlt62 x1n2onr6" and contains(text(), "Bạn viết gì đi...")]'))
-                )
-                can_post = "Yes"
-            except:
-                try:
-                    post_box_en = WebDriverWait(chrome_instance.driver, 2).until(
-                        EC.presence_of_element_located((By.XPATH, '//span[@class="x1lliihq x6ikm8r x10wlt62 x1n2onr6" and contains(text(), "Write something...")]'))
-                    )
-                    can_post = "Yes"
-                except:
-                    can_post = "No"
-        except Exception as e:
-            print(f"[Worker {chrome_instance.worker_id}] Lỗi khi kiểm tra quyền đăng bài: {str(e)}")
-            can_post = "No"
+def process_single_group(chrome_instance, group_url, search_keywords, output_dir, lock, retry_count=0):
+print(f"[Worker {chrome_instance.worker_id}] Đang xử lý nhóm: {group_url}")
+print(f"[Worker {chrome_instance.worker_id}] Bắt đầu xử lý URL: {group_url}")
 
-        # Thực hiện scroll
-        num_scrolls = random.randint(1, 3)
-        for i in range(num_scrolls):
-            chrome_instance.driver.execute_script("window.scrollBy(0, 600)")
-            time.sleep(random.uniform(0.5, 1))
-            
-            # Check popup sau lần scroll cuối cùng
-            if i == num_scrolls - 1:  # Thay đổi điều kiện từ i == 0 thành i == num_scrolls - 1
-                time.sleep(1)
-                handle_popup()
+# Tạo đường dẫn file CSV riêng cho worker này
+worker_csv_file = os.path.join(output_dir, f'groups_data_worker_{chrome_instance.worker_id}.csv')
 
-        group_data = {
-            'keyword_search': search_keywords,
-            'group_name': group_name,
-            'group_link': group_url,
-            'group_type': group_type,
-            'members_count': numeric_members_count,
-            'can_post': can_post
-        }
+# Kiểm tra URL đã tồn tại trong file CSV riêng của worker chưa
+if check_url_exists_in_csv(group_url, worker_csv_file):
+print(f"[Worker {chrome_instance.worker_id}] URL đã tồn tại trong CSV, bỏ qua: {group_url}")
+chrome_instance.processed_groups.add(group_url)
+return True
 
-        with lock:
-            try:
-                write_header = not os.path.exists(output_file)
-                with open(output_file, 'a', newline='', encoding='utf-8-sig') as f:
-                    writer = csv.DictWriter(f, fieldnames=list(group_data.keys()))
-                    if write_header:
-                        writer.writeheader()
-                    writer.writerow(group_data)
-                print(f"[Worker {chrome_instance.worker_id}] Đã lưu thành công nhóm: {group_name}")
-                chrome_instance.update_activity_time()
-                return True
-            except Exception as e:
-                print(f"[Worker {chrome_instance.worker_id}] Lỗi lưu dữ liệu: {str(e)}")
-                return False
+try:
+chrome_instance.driver.get(group_url)
+chrome_instance.url_monitor()
+chrome_instance.update_activity_time()
 
-    except Exception as e:
-        print(f"[Worker {chrome_instance.worker_id}] Lỗi xử lý nhóm {group_url}: {str(e)}")
-        chrome_instance.failed_urls.append({
-            'url': group_url,
-            'error': str(e),
-            'timestamp': datetime.now().isoformat()
-        })
-        if retry_count < MAX_RETRIES:
-            time.sleep(random.uniform(1, 2))
-            return process_single_group(chrome_instance, group_url, search_keywords, output_file, lock, retry_count + 1)
-        return False
+time.sleep(random.uniform(2, 3))
+
+# Kiểm tra logout
+if chrome_instance.check_logout():
+print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
+chrome_instance.kill_chrome()
+return False
+
+def handle_popup():
+"""Xử lý popup block"""
+if chrome_instance.close_block_popup():
+print(f"[Worker {chrome_instance.worker_id}] Đã đóng popup block")
+time.sleep(random.uniform(1, 2))
+return True
+return False
+
+# Check popup sau khi load trang
+time.sleep(1)
+handle_popup()
+
+if "content not found" in chrome_instance.driver.page_source.lower() or "không tìm thấy nội dung" in chrome_instance.driver.page_source.lower():
+if retry_count < MAX_RETRIES:
+time.sleep(random.uniform(1, 3))
+return process_single_group(chrome_instance, group_url, search_keywords, output_dir, lock, retry_count + 1)
+else:
+raise Exception("Không thể tải trang sau nhiều lần thử")
+
+try:
+group_name_element = WebDriverWait(chrome_instance.driver, 2).until(
+EC.presence_of_element_located((By.XPATH, "//h1//a[contains(@class, 'x16tdsg8')]"))
+)
+group_name = group_name_element.text.strip()
+except:
+if retry_count < MAX_RETRIES:
+time.sleep(random.uniform(1, 2))
+return process_single_group(chrome_instance, group_url, search_keywords, output_dir, lock, retry_count + 1)
+else:
+raise Exception("Không thể lấy tên nhóm")
+
+try:
+group_type_element = WebDriverWait(chrome_instance.driver, 1).until(
+EC.presence_of_element_located((By.XPATH, "//div[contains(text(), 'Nhóm') and contains(@class, 'x1n2onr6')]"))
+)
+group_type = group_type_element.text.strip()
+except:
+group_type = "Unknown"
+
+try:
+members_element = WebDriverWait(chrome_instance.driver, 1).until(
+EC.presence_of_element_located((By.XPATH, "//a[contains(@href, '/members/')]"))
+)
+members_text = members_element.text
+members_match = re.search(r'([\d,\.]+[KMB]?) thành viên', members_text)
+members_count = members_match.group(1) if members_match else "0"
+except:
+if retry_count < MAX_RETRIES:
+time.sleep(random.uniform(1, 2))
+return process_single_group(chrome_instance, group_url, search_keywords, output_dir, lock, retry_count + 1)
+else:
+members_count = "0"
+
+numeric_members_count = convert_members_count(members_count)
+
+print(f"[Worker {chrome_instance.worker_id}] Đã lấy được thông tin nhóm: {group_name}, members: {numeric_members_count}")
+
+# Kiểm tra nếu không lấy được group_type và members_count
+if group_type == "Unknown" and members_count == "0":
+chrome_instance.failed_urls.append({
+'url': group_url,
+'error': "Không thể lấy group_type và members_count",
+'timestamp': datetime.now().isoformat()
+})
+return True
+
+try:
+can_post = "No"
+try:
+post_box_vn = WebDriverWait(chrome_instance.driver, 2).until(
+EC.presence_of_element_located((By.XPATH, '//span[@class="x1lliihq x6ikm8r x10wlt62 x1n2onr6" and contains(text(), "Bạn viết gì đi...")]'))
+)
+can_post = "Yes"
+except:
+try:
+post_box_en = WebDriverWait(chrome_instance.driver, 2).until(
+EC.presence_of_element_located((By.XPATH, '//span[@class="x1lliihq x6ikm8r x10wlt62 x1n2onr6" and contains(text(), "Write something...")]'))
+)
+can_post = "Yes"
+except:
+can_post = "No"
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi khi kiểm tra quyền đăng bài: {str(e)}")
+can_post = "No"
+
+# Thực hiện scroll
+num_scrolls = random.randint(1, 3)
+for i in range(num_scrolls):
+chrome_instance.driver.execute_script("window.scrollBy(0, 600)")
+time.sleep(random.uniform(0.5, 1))
+
+# Check popup sau lần scroll cuối cùng
+if i == num_scrolls - 1:
+time.sleep(1)
+handle_popup()
+
+group_data = {
+'keyword_search': search_keywords,
+'group_name': group_name,
+'group_link': group_url,
+'group_type': group_type,
+'members_count': numeric_members_count,
+'can_post': can_post
+}
+
+print(f"[Worker {chrome_instance.worker_id}] Chuẩn bị lưu dữ liệu nhóm: {group_name}")
+
+# Ghi dữ liệu vào file CSV riêng của worker
+try:
+# Kiểm tra xem file đã tồn tại chưa để quyết định có ghi header hay không
+write_header = not os.path.exists(worker_csv_file)
+
+# Sử dụng lock khi ghi file để tránh xung đột
+with lock:
+with open(worker_csv_file, 'a', newline='', encoding='utf-8-sig') as f:
+writer = csv.DictWriter(f, fieldnames=list(group_data.keys()))
+if write_header:
+writer.writeheader()
+writer.writerow(group_data)
+
+# Đánh dấu URL đã được xử lý
+chrome_instance.processed_groups.add(group_url)
+
+print(f"[Worker {chrome_instance.worker_id}] Đã lưu thành công nhóm: {group_name}")
+chrome_instance.update_activity_time()
+return True
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi lưu dữ liệu: {str(e)}")
+return False
+
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi xử lý nhóm {group_url}: {str(e)}")
+chrome_instance.failed_urls.append({
+'url': group_url,
+'error': str(e),
+'timestamp': datetime.now().isoformat()
+})
+if retry_count < MAX_RETRIES:
+time.sleep(random.uniform(1, 2))
+return process_single_group(chrome_instance, group_url, search_keywords, output_dir, lock, retry_count + 1)
+return False
 
 def worker_process(chrome_instance: ChromeInstance, keywords: List[str], processed_items: set, processed_groups: set, lock, output_dir, available_chrome_commands, active_chrome_instances):
-    try:
-        # Khởi động Chrome instance
-        if not chrome_instance.start_chrome():
-            print(f"[Worker {chrome_instance.worker_id}] Không thể khởi động Chrome")
-            return
-            
-        try:
-            driver = chrome_instance.create_driver()
-            with lock:
-                active_chrome_instances[chrome_instance.worker_id] = chrome_instance
-        except Exception as e:
-            print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo driver: {str(e)}")
-            chrome_instance.kill_chrome()
-            return
-            
-        output_file = os.path.join(output_dir, 'groups_data.csv')
-        retry_count = 0
+try:
+# Khởi động Chrome instance
+if not chrome_instance.start_chrome():
+print(f"[Worker {chrome_instance.worker_id}] Không thể khởi động Chrome")
 
-        # Kiểm tra và load tiến độ trước đó
-        progress_data = chrome_instance.load_progress(output_dir)
-        if progress_data:
-            print(f"[Worker {chrome_instance.worker_id}] Tìm thấy tiến độ trước đó:")
-            print(f"- Keyword: {progress_data['keyword']}")
-            print(f"- Số URL còn lại: {len(progress_data['urls']) - progress_data['current_index']}")
-            
-            # Thêm tracking URLs đã xử lý
-            processed_urls_tracking = set()
-            skipped_urls = []
-            
-            remaining_urls = progress_data['urls'][progress_data['current_index']:]
-            total_remaining = len(remaining_urls)
-            
-            for idx, group_url in enumerate(remaining_urls, 1):
-                current_index = progress_data['current_index'] + idx - 1
-                
-                # Kiểm tra URL đã xử lý chưa
-                if group_url in processed_groups or group_url in processed_urls_tracking:
-                    print(f"[Worker {chrome_instance.worker_id}] URL đã xử lý trước đó: {group_url}")
-                    continue
+# Thay vì đưa vào blacklist, đưa lệnh Chrome trở lại hàng đợi để sử dụng lại sau
+if chrome_instance.chrome_command:
+with lock:
+available_chrome_commands.append(chrome_instance.chrome_command)
+print(f"[Worker {chrome_instance.worker_id}] Đưa lệnh Chrome trở lại hàng đợi để thử lại sau")
+return
 
-                print(f"[Worker {chrome_instance.worker_id}] Đang xử lý nhóm {idx}/{total_remaining} (Index: {current_index})")
-                
-                # Kiểm tra logout trước khi xử lý URL
-                if chrome_instance.check_logout():
-                    print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
-                    chrome_instance.kill_chrome()
-                    
-                    # Lưu tiến độ hiện tại trước khi khởi động lại
-                    chrome_instance.save_progress(
-                        progress_data['keyword'],
-                        progress_data['urls'],
-                        current_index,
-                        output_dir
-                    )
-                    
-                    # Khởi động lại Chrome
-                    chrome_instance.start_chrome()
-                    try:
-                        driver = chrome_instance.create_driver()
-                    except Exception as e:
-                        print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
-                        break
-                
-                try:
-                    if process_single_group(chrome_instance, group_url, progress_data['keyword'], output_file, lock):
-                        with lock:
-                            processed_groups.add(group_url)
-                            chrome_instance.processed_groups.add(group_url)
-                            processed_urls_tracking.add(group_url)
-                    else:
-                        skipped_urls.append({
-                            'url': group_url,
-                            'index': current_index,
-                            'reason': 'Processing failed'
-                        })
-                except Exception as e:
-                    print(f"[Worker {chrome_instance.worker_id}] Lỗi xử lý URL {group_url}: {str(e)}")
-                    skipped_urls.append({
-                        'url': group_url,
-                        'index': current_index,
-                        'reason': str(e)
-                    })
+try:
+driver = chrome_instance.create_driver()
 
-                # Kiểm tra nếu chrome bị đơ
-                if chrome_instance.is_inactive():
-                    print(f"[Worker {chrome_instance.worker_id}] Chrome instance không hoạt động quá 5 phút, khởi động lại...")
-                    chrome_instance.kill_chrome()
-                    
-                    # Lưu tiến độ hiện tại trước khi khởi động lại
-                    chrome_instance.save_progress(
-                        progress_data['keyword'],
-                        progress_data['urls'],
-                        current_index + 1,
-                        output_dir
-                    )
-                    
-                    # Khởi động lại Chrome
-                    chrome_instance.start_chrome()
-                    try:
-                        driver = chrome_instance.create_driver()
-                    except Exception as e:
-                        print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
-                        break
+# Thêm tham chiếu đến lock
+chrome_instance.lock = lock
 
-                # Lưu tiến độ sau mỗi URL
-                chrome_instance.save_progress(
-                    progress_data['keyword'],
-                    progress_data['urls'],
-                    current_index + 1,  # Cập nhật index chính xác
-                    output_dir
-                )
+# Thêm thuộc tính profile_switch_failed nếu chưa có
+if not hasattr(chrome_instance, 'profile_switch_failed'):
+chrome_instance.profile_switch_failed = False
 
-                time.sleep(random.uniform(MIN_DELAY_BETWEEN_REQUESTS, MAX_DELAY_BETWEEN_REQUESTS))
+# Chuyển đổi sang page profile
+if not chrome_instance.switch_to_profile_page():
+print(f"[Worker {chrome_instance.worker_id}] Không thể chuyển sang page profile, đóng Chrome và dừng worker")
 
-            # Lưu thông tin URLs bị bỏ qua
-            if skipped_urls:
-                skipped_file = os.path.join(output_dir, f'skipped_urls_worker_{chrome_instance.worker_id}.json')
-                with open(skipped_file, 'w', encoding='utf-8') as f:
-                    json.dump({
-                        'keyword': progress_data['keyword'],
-                        'skipped_urls': skipped_urls,
-                        'timestamp': datetime.now().isoformat()
-                    }, f, ensure_ascii=False, indent=2)
-                print(f"[Worker {chrome_instance.worker_id}] Đã lưu {len(skipped_urls)} URLs bị bỏ qua")
+# Thay vì đưa vào blacklist, đưa lệnh Chrome trở lại hàng đợi
+if hasattr(chrome_instance, 'chrome_command') and chrome_instance.chrome_command:
+with lock:
+available_chrome_commands.append(chrome_instance.chrome_command)
+print(f"[Worker {chrome_instance.worker_id}] Đưa lệnh Chrome trở lại hàng đợi để thử lại sau")
 
-            # Xóa file tiến độ sau khi hoàn thành
-            chrome_instance.clear_progress(output_dir)
-            print(f"[Worker {chrome_instance.worker_id}] Đã hoàn thành xử lý các URL còn lại")
+# Chrome đã được đóng trong phương thức switch_to_profile_page()
+return # Dừng worker
 
-        while True:
-            # Kiểm tra nếu chrome bị đơ
-            if chrome_instance.is_inactive():
-                print(f"[Worker {chrome_instance.worker_id}] Chrome instance không hoạt động quá 5 phút, khởi động lại...")
-                chrome_instance.kill_chrome()
-                chrome_instance.start_chrome()
-                try:
-                    driver = chrome_instance.create_driver()
-                except Exception as e:
-                    print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
-                    break
+with lock:
+active_chrome_instances[chrome_instance.worker_id] = chrome_instance
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo driver: {str(e)}")
+# Đưa lệnh Chrome trở lại hàng đợi
+if hasattr(chrome_instance, 'chrome_command') and chrome_instance.chrome_command:
+with lock:
+available_chrome_commands.append(chrome_instance.chrome_command)
+print(f"[Worker {chrome_instance.worker_id}] Đưa lệnh Chrome trở lại hàng đợi để thử lại sau")
+chrome_instance.kill_chrome()
+return
 
-            if chrome_instance.check_logout():
-                print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
-                chrome_instance.kill_chrome()
-                chrome_instance.start_chrome()
-                try:
-                    driver = chrome_instance.create_driver()
-                except Exception as e:
-                    print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
-                    break
+output_file = os.path.join(output_dir, 'groups_data.csv')
+retry_count = 0
 
-            if chrome_instance.check_checkpoint():
-                chrome_instance.is_checkpoint = True
-                print(f"[Worker {chrome_instance.worker_id}] Tài khoản bị checkpoint, dừng worker")
-                break
+# Kiểm tra và load tiến độ trước đó
+progress_data = chrome_instance.load_progress(output_dir)
+if progress_data:
+print(f"[Worker {chrome_instance.worker_id}] Tìm thấy tiến độ trước đó:")
+print(f"- Keyword: {progress_data['keyword']}")
+print(f"- Số URL còn lại: {len(progress_data['urls']) - progress_data['current_index']}")
 
-            if chrome_instance.check_blocked():
-                chrome_instance.is_blocked = True
-                print(f"[Worker {chrome_instance.worker_id}] Tài khoản bị chặn tạm thời, dừng worker")
-                break
-            
-            if chrome_instance.check_suspicious():
-                print(f"[Worker {chrome_instance.worker_id}] Đã xử lý cảnh báo suspicious")
-                time.sleep(random.uniform(1, 2))
-                continue
+# Thêm tracking URLs đã xử lý
+processed_urls_tracking = set()
+skipped_urls = []
 
-            with lock:
-                if len(keywords) < 2:
-                    break
-                selected_keywords = random.sample(keywords, 2)
-                search_keywords = ' '.join(selected_keywords)
+remaining_urls = progress_data['urls'][progress_data['current_index']:]
+total_remaining = len(remaining_urls)
 
-            if search_keywords in processed_items:
-                continue
+for idx, group_url in enumerate(remaining_urls, 1):
+current_index = progress_data['current_index'] + idx - 1
 
-            try:
-                encoded_keywords = '%20'.join(search_keywords.split())
-                search_url = f"https://www.facebook.com/groups/search/groups?q={encoded_keywords}&filters=eyJwdWJsaWNfZ3JvdXBzOjAiOiJ7XCJuYW1lXCI6XCJwdWJsaWNfZ3JvdXBzXCIsXCJhcmdzXCI6XCJcIn0ifQ%3D%3D"
+# Kiểm tra URL đã xử lý chưa
+if group_url in processed_groups or group_url in processed_urls_tracking:
+print(f"[Worker {chrome_instance.worker_id}] URL đã xử lý trước đó: {group_url}")
+continue
 
-                print(f"\n[Worker {chrome_instance.worker_id}] Tìm kiếm với từ khóa: {search_keywords}")
-                driver.get(search_url)
-                chrome_instance.update_activity_time()
-                time.sleep(random.uniform(2, 3))
-                
-                # Kiểm tra logout sau khi truy cập search_url
-                if chrome_instance.check_logout():
-                    print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
-                    chrome_instance.kill_chrome()
-                    chrome_instance.start_chrome()
-                    try:
-                        driver = chrome_instance.create_driver()
-                        continue  # Bỏ qua từ khóa này và thử lại với từ khóa khác
-                    except Exception as e:
-                        print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
-                        break
+print(f"[Worker {chrome_instance.worker_id}] Đang xử lý nhóm {idx}/{total_remaining} (Index: {current_index})")
 
-                group_urls = chrome_instance.scroll_and_collect_groups()
-                if not group_urls:
-                    print(f"[Worker {chrome_instance.worker_id}] Không tìm thấy URLs cho từ khóa: {search_keywords}")
-                    continue
+# Kiểm tra logout trước khi xử lý URL
+if chrome_instance.check_logout():
+print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
+chrome_instance.kill_chrome()
 
-                save_group_urls(group_urls, search_keywords, output_dir, chrome_instance.worker_id)
+# Lưu tiến độ hiện tại trước khi khởi động lại
+chrome_instance.save_progress(
+progress_data['keyword'],
+progress_data['urls'],
+current_index,
+output_dir
+)
 
-                total_urls = len(group_urls)
-                processed_urls = 0
-                failed_urls = 0
+# Khởi động lại Chrome
+chrome_instance.start_chrome()
+try:
+driver = chrome_instance.create_driver()
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+break
 
-                print(f"[Worker {chrome_instance.worker_id}] Bắt đầu xử lý {total_urls} nhóm...")
-                
-                for idx, group_url in enumerate(group_urls, 1):
-                    if group_url in processed_groups:
-                        processed_urls += 1
-                        continue
+try:
+if process_single_group(chrome_instance, group_url, progress_data['keyword'], output_dir, lock):
+with lock:
+processed_groups.add(group_url)
+chrome_instance.processed_groups.add(group_url)
+processed_urls_tracking.add(group_url)
 
-                    print(f"[Worker {chrome_instance.worker_id}] Đang xử lý nhóm {idx}/{total_urls}")
-                    
-                    # Kiểm tra logout trước khi xử lý mỗi URL
-                    if chrome_instance.check_logout():
-                        print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
-                        chrome_instance.kill_chrome()
-                        
-                        # Lưu tiến độ hiện tại trước khi khởi động lại
-                        chrome_instance.save_progress(
-                            search_keywords,
-                            group_urls,
-                            idx - 1,
-                            output_dir
-                        )
-                        
-                        # Khởi động lại Chrome
-                        chrome_instance.start_chrome()
-                        try:
-                            driver = chrome_instance.create_driver()
-                        except Exception as e:
-                            print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
-                            break
-                    
-                    # Lưu tiến độ trước khi xử lý mỗi URL
-                    chrome_instance.save_progress(
-                        search_keywords,
-                        group_urls,
-                        idx - 1,
-                        output_dir
-                    )
-                    
-                    if process_single_group(chrome_instance, group_url, search_keywords, output_file, lock):
-                        with lock:
-                            processed_groups.add(group_url)
-                            chrome_instance.processed_groups.add(group_url)
-                        processed_urls += 1
-                    else:
-                        failed_urls += 1
+if idx % 10 == 0: # Cứ mỗi 10 URL thì dọn dẹp bộ nhớ một lần
+chrome_instance.cleanup_memory()
+else:
+skipped_urls.append({
+'url': group_url,
+'index': current_index,
+'reason': 'Processing failed'
+})
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi xử lý URL {group_url}: {str(e)}")
+skipped_urls.append({
+'url': group_url,
+'index': current_index,
+'reason': str(e)
+})
 
-                    # Kiểm tra nếu chrome bị đơ
-                    if chrome_instance.is_inactive():
-                        print(f"[Worker {chrome_instance.worker_id}] Chrome instance không hoạt động quá 5 phút, khởi động lại...")
-                        chrome_instance.kill_chrome()
-                        
-                        # Lưu tiến độ hiện tại trước khi khởi động lại
-                        chrome_instance.save_progress(
-                            search_keywords,
-                            group_urls,
-                            idx,
-                            output_dir
-                        )
-                        
-                        # Khởi động lại Chrome
-                        chrome_instance.start_chrome()
-                        try:
-                            driver = chrome_instance.create_driver()
-                        except Exception as e:
-                            print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
-                            break
+# Kiểm tra nếu chrome bị đơ
+if chrome_instance.is_inactive():
+print(f"[Worker {chrome_instance.worker_id}] Chrome instance không hoạt động quá 5 phút, khởi động lại...")
+chrome_instance.kill_chrome()
 
-                    time.sleep(random.uniform(MIN_DELAY_BETWEEN_REQUESTS, MAX_DELAY_BETWEEN_REQUESTS))
+# Lưu tiến độ hiện tại trước khi khởi động lại
+chrome_instance.save_progress(
+progress_data['keyword'],
+progress_data['urls'],
+current_index + 1,
+output_dir
+)
 
-                # Xóa file tiến độ sau khi hoàn thành keyword
-                chrome_instance.clear_progress(output_dir)
+# Khởi động lại Chrome
+chrome_instance.start_chrome()
+try:
+driver = chrome_instance.create_driver()
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+break
 
-                print(f"[Worker {chrome_instance.worker_id}] Kết quả xử lý keyword '{search_keywords}':")
-                print(f"- Tổng số URLs: {total_urls}")
-                print(f"- Đã xử lý: {processed_urls}")
-                print(f"- Thất bại: {failed_urls}")
-                
-                chrome_instance.close_block_popup()
-                time.sleep(1)  # Chờ 1 giây sau khi đóng popup
+# Lưu tiến độ sau mỗi URL
+chrome_instance.save_progress(
+progress_data['keyword'],
+progress_data['urls'],
+current_index + 1, # Cập nhật index chính xác
+output_dir
+)
 
-                if chrome_instance.check_blocked():
-                    chrome_instance.is_blocked = True
-                    print(f"[Worker {chrome_instance.worker_id}] Tài khoản bị chặn tạm thời, dừng worker")
-                    break                
+time.sleep(random.uniform(MIN_DELAY_BETWEEN_REQUESTS, MAX_DELAY_BETWEEN_REQUESTS))
 
-                chrome_instance.processed_count += 1
-                with lock:
-                    processed_items.add(search_keywords)
-                    if chrome_instance.processed_count % 10 == 0:
-                        save_progress(processed_items, processed_groups, output_dir)
+# Lưu thông tin URLs bị bỏ qua
+if skipped_urls:
+skipped_file = os.path.join(output_dir, f'skipped_urls_worker_{chrome_instance.worker_id}.json')
+with open(skipped_file, 'w', encoding='utf-8') as f:
+json.dump({
+'keyword': progress_data['keyword'],
+'skipped_urls': skipped_urls,
+'timestamp': datetime.now().isoformat()
+}, f, ensure_ascii=False, indent=2)
+print(f"[Worker {chrome_instance.worker_id}] Đã lưu {len(skipped_urls)} URLs bị bỏ qua")
 
-            except Exception as e:
-                print(f"[Worker {chrome_instance.worker_id}] Lỗi xử lý từ khóa {search_keywords}: {str(e)}")
-                retry_count += 1
-                if retry_count >= MAX_RETRIES:
-                    print(f"[Worker {chrome_instance.worker_id}] Đã vượt quá số lần thử lại cho phép")
-                    break
-                time.sleep(random.uniform(2, 4))
+# Xóa file tiến độ sau khi hoàn thành
+chrome_instance.clear_progress(output_dir)
+print(f"[Worker {chrome_instance.worker_id}] Đã hoàn thành xử lý các URL còn lại")
 
-    except Exception as e:
-        print(f"[Worker {chrome_instance.worker_id}] Lỗi: {str(e)}")
-    finally:
-        if chrome_instance.failed_urls:
-            save_failed_urls(chrome_instance.failed_urls, output_dir, chrome_instance.worker_id)
-            
-        # Xóa instance khỏi dict active_chrome_instances
-        with lock:
-            if chrome_instance.worker_id in active_chrome_instances:
-                del active_chrome_instances[chrome_instance.worker_id]
-        
-        if chrome_instance.driver:
-            try:
-                chrome_instance.driver.quit()
-            except:
-                pass
-                
-        chrome_instance.kill_chrome()
-        
-        # Khởi động Chrome instance mới nếu còn lệnh chrome trong hàng đợi
-        with lock:
-            if available_chrome_commands:
-                new_command = available_chrome_commands.pop(0)
-                new_port_match = re.search(r'--remote-debugging-port=(\d+)', new_command)
-                if new_port_match:
-                    new_port = int(new_port_match.group(1))
-                    new_worker_id = new_port - 9222 + 1
-                    print(f"Khởi động worker mới với port {new_port} (Worker ID: {new_worker_id})")
-                    
-                    new_chrome = ChromeInstance(debug_port=new_port, worker_id=new_worker_id, chrome_command=new_command)
-                    new_thread = threading.Thread(
-                        target=worker_process,
-                        args=(new_chrome, keywords, processed_items, processed_groups, lock, output_dir, available_chrome_commands, active_chrome_instances)
-                    )
-                    new_thread.daemon = True
-                    new_thread.start()
+while True:
+
+# Kiểm tra timeout trước khi thực hiện các thao tác khác
+try:
+if chrome_instance.check_timeout_errors():
+print(f"[Worker {chrome_instance.worker_id}] Chrome bị lỗi timeout, khởi động lại...")
+chrome_instance.kill_chrome()
+chrome_instance.start_chrome()
+try:
+driver = chrome_instance.create_driver()
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+break
+continue
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi khi kiểm tra timeout: {str(e)}")
+
+# Kiểm tra nếu chrome bị đơ
+if chrome_instance.is_inactive():
+print(f"[Worker {chrome_instance.worker_id}] Chrome instance không hoạt động quá 5 phút, khởi động lại...")
+chrome_instance.kill_chrome()
+chrome_instance.start_chrome()
+try:
+driver = chrome_instance.create_driver()
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+break
+
+if chrome_instance.check_logout():
+print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
+chrome_instance.kill_chrome()
+chrome_instance.start_chrome()
+try:
+driver = chrome_instance.create_driver()
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+break
+
+if chrome_instance.check_checkpoint():
+chrome_instance.is_checkpoint = True
+print(f"[Worker {chrome_instance.worker_id}] Tài khoản bị checkpoint, dừng worker")
+
+# Đưa lệnh Chrome trở lại hàng đợi
+if hasattr(chrome_instance, 'chrome_command') and chrome_instance.chrome_command:
+with lock:
+available_chrome_commands.append(chrome_instance.chrome_command)
+print(f"[Worker {chrome_instance.worker_id}] Đưa lệnh Chrome trở lại hàng đợi để thử lại sau")
+break
+
+if chrome_instance.check_blocked():
+chrome_instance.is_blocked = True
+print(f"[Worker {chrome_instance.worker_id}] Tài khoản bị chặn tạm thời, dừng worker")
+
+# Đưa lệnh Chrome trở lại hàng đợi
+if hasattr(chrome_instance, 'chrome_command') and chrome_instance.chrome_command:
+with lock:
+available_chrome_commands.append(chrome_instance.chrome_command)
+print(f"[Worker {chrome_instance.worker_id}] Đưa lệnh Chrome trở lại hàng đợi để thử lại sau")
+break
+
+if chrome_instance.check_suspicious():
+print(f"[Worker {chrome_instance.worker_id}] Đã xử lý cảnh báo suspicious")
+time.sleep(random.uniform(1, 2))
+continue
+
+with lock:
+if len(keywords) < 2:
+break
+selected_keywords = random.sample(keywords, 2)
+search_keywords = ' '.join(selected_keywords)
+
+if search_keywords in processed_items:
+continue
+
+try:
+encoded_keywords = '%20'.join(search_keywords.split())
+search_url = f"https://www.facebook.com/groups/search/groups?q={encoded_keywords}&filters=eyJwdWJsaWNfZ3JvdXBzOjAiOiJ7XCJuYW1lXCI6XCJwdWJsaWNfZ3JvdXBzXCIsXCJhcmdzXCI6XCJcIn0ifQ%3D%3D"
+
+print(f"\n[Worker {chrome_instance.worker_id}] Tìm kiếm với từ khóa: {search_keywords}")
+driver.get(search_url)
+chrome_instance.update_activity_time()
+time.sleep(random.uniform(2, 3))
+
+# Kiểm tra logout sau khi truy cập search_url
+if chrome_instance.check_logout():
+print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
+chrome_instance.kill_chrome()
+chrome_instance.start_chrome()
+try:
+driver = chrome_instance.create_driver()
+continue # Bỏ qua từ khóa này và thử lại với từ khóa khác
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+break
+
+# Thêm thuộc tính để theo dõi trạng thái thu thập URL
+chrome_instance.is_collecting_urls = True
+
+try:
+group_urls = chrome_instance.scroll_and_collect_groups()
+# Đánh dấu đã hoàn thành thu thập URL
+chrome_instance.is_collecting_urls = False
+
+if not group_urls:
+print(f"[Worker {chrome_instance.worker_id}] Không tìm thấy URLs cho từ khóa: {search_keywords}")
+continue
+except Exception as e:
+# Đánh dấu đã hoàn thành thu thập URL ngay cả khi có lỗi
+chrome_instance.is_collecting_urls = False
+print(f"[Worker {chrome_instance.worker_id}] Lỗi khi thu thập URLs: {str(e)}")
+continue
+
+save_group_urls(group_urls, search_keywords, output_dir, chrome_instance.worker_id)
+
+total_urls = len(group_urls)
+processed_urls = 0
+failed_urls = 0
+
+print(f"[Worker {chrome_instance.worker_id}] Bắt đầu xử lý {total_urls} nhóm...")
+
+for idx, group_url in enumerate(group_urls, 1):
+if group_url in processed_groups:
+processed_urls += 1
+continue
+
+print(f"[Worker {chrome_instance.worker_id}] Đang xử lý nhóm {idx}/{total_urls}")
+
+# Kiểm tra logout trước khi xử lý mỗi URL
+if chrome_instance.check_logout():
+print(f"[Worker {chrome_instance.worker_id}] Phát hiện Chrome đã logout, cần khởi động lại")
+chrome_instance.kill_chrome()
+
+# Lưu tiến độ hiện tại trước khi khởi động lại
+chrome_instance.save_progress(
+search_keywords,
+group_urls,
+idx - 1,
+output_dir
+)
+
+# Khởi động lại Chrome
+chrome_instance.start_chrome()
+try:
+driver = chrome_instance.create_driver()
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+break
+
+# Lưu tiến độ trước khi xử lý mỗi URL
+chrome_instance.save_progress(
+search_keywords,
+group_urls,
+idx - 1,
+output_dir
+)
+
+if process_single_group(chrome_instance, group_url, search_keywords, output_dir, lock):
+with lock:
+processed_groups.add(group_url)
+chrome_instance.processed_groups.add(group_url)
+processed_urls += 1
+
+if idx % 10 == 0: # Cứ mỗi 10 URL thì dọn dẹp bộ nhớ một lần
+chrome_instance.cleanup_memory()
+else:
+failed_urls += 1
+
+# Kiểm tra nếu chrome bị đơ
+if chrome_instance.is_inactive():
+print(f"[Worker {chrome_instance.worker_id}] Chrome instance không hoạt động quá 5 phút, khởi động lại...")
+chrome_instance.kill_chrome()
+
+# Lưu tiến độ hiện tại trước khi khởi động lại
+chrome_instance.save_progress(
+search_keywords,
+group_urls,
+idx,
+output_dir
+)
+
+# Khởi động lại Chrome
+chrome_instance.start_chrome()
+try:
+driver = chrome_instance.create_driver()
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi khởi tạo lại driver: {str(e)}")
+break
+
+time.sleep(random.uniform(MIN_DELAY_BETWEEN_REQUESTS, MAX_DELAY_BETWEEN_REQUESTS))
+
+# Xóa file tiến độ sau khi hoàn thành keyword
+chrome_instance.clear_progress(output_dir)
+
+print(f"[Worker {chrome_instance.worker_id}] Kết quả xử lý keyword '{search_keywords}':")
+print(f"- Tổng số URLs: {total_urls}")
+print(f"- Đã xử lý: {processed_urls}")
+print(f"- Thất bại: {failed_urls}")
+
+chrome_instance.close_block_popup()
+time.sleep(1) # Chờ 1 giây sau khi đóng popup
+
+if chrome_instance.check_blocked():
+chrome_instance.is_blocked = True
+print(f"[Worker {chrome_instance.worker_id}] Tài khoản bị chặn tạm thời, dừng worker")
+
+# Đưa lệnh Chrome trở lại hàng đợi
+if hasattr(chrome_instance, 'chrome_command') and chrome_instance.chrome_command:
+with lock:
+available_chrome_commands.append(chrome_instance.chrome_command)
+print(f"[Worker {chrome_instance.worker_id}] Đưa lệnh Chrome trở lại hàng đợi để thử lại sau")
+break
+
+chrome_instance.processed_count += 1
+with lock:
+processed_items.add(search_keywords)
+if chrome_instance.processed_count % 10 == 0:
+save_progress(processed_items, processed_groups, output_dir)
+
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi xử lý từ khóa {search_keywords}: {str(e)}")
+retry_count += 1
+if retry_count >= MAX_RETRIES:
+print(f"[Worker {chrome_instance.worker_id}] Đã vượt quá số lần thử lại cho phép")
+break
+time.sleep(random.uniform(2, 4))
+
+except Exception as e:
+print(f"[Worker {chrome_instance.worker_id}] Lỗi: {str(e)}")
+finally:
+if chrome_instance.failed_urls:
+save_failed_urls(chrome_instance.failed_urls, output_dir, chrome_instance.worker_id)
+
+# Xóa instance khỏi dict active_chrome_instances
+with lock:
+if chrome_instance.worker_id in active_chrome_instances:
+del active_chrome_instances[chrome_instance.worker_id]
+
+if chrome_instance.driver:
+try:
+chrome_instance.driver.quit()
+except:
+pass
+
+chrome_instance.kill_chrome()
 
 def load_keywords(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        return [line.strip() for line in f.readlines() if line.strip()]
+with open(file_path, 'r', encoding='utf-8') as f:
+return [line.strip() for line in f.readlines() if line.strip()]
 
 def get_combinations_count(n):
-    # Tính số tổ hợp chập 2 của n phần tử
-    return (n * (n - 1)) // 2
+# Tính số tổ hợp chập 2 của n phần tử
+return (n * (n - 1)) // 2
 
 def load_progress(output_dir):
-    try:
-        with open(os.path.join(output_dir, 'scan_progress.json'), 'r') as f:
-            data = json.load(f)
-            return data.get('processed_items', []), set(data.get('processed_groups', []))
-    except:
-        return [], set()
+try:
+with open(os.path.join(output_dir, 'scan_progress.json'), 'r') as f:
+data = json.load(f)
+return data.get('processed_items', []), set(data.get('processed_groups', []))
+except:
+return [], set()
 
 def save_progress(processed_items, processed_groups, output_dir):
-    with open(os.path.join(output_dir, 'scan_progress.json'), 'w') as f:
-        json.dump({
-            'processed_items': list(processed_items),
-            'processed_groups': list(processed_groups)
-        }, f)
+with open(os.path.join(output_dir, 'scan_progress.json'), 'w') as f:
+json.dump({
+'processed_items': list(processed_items),
+'processed_groups': list(processed_groups)
+}, f)
 
 class OutputLogger:
-    def __init__(self, output_dir):
-        self.terminal = sys.stdout
-        self.log_file = os.path.join(output_dir, 'console_log.json')
-        self.log_data = []
-        self.MAX_LOG_ENTRIES = 1000
-        
-        # Load existing logs if any
-        if os.path.exists(self.log_file):
-            try:
-                with open(self.log_file, 'r', encoding='utf-8') as f:
-                    self.log_data = json.load(f)
-                    # Ensure we only keep the latest MAX_LOG_ENTRIES
-                    if len(self.log_data) > self.MAX_LOG_ENTRIES:
-                        self.log_data = self.log_data[-self.MAX_LOG_ENTRIES:]
-            except:
-                self.log_data = []
+def __init__(self, output_dir):
+self.terminal = sys.stdout
+self.log_file = os.path.join(output_dir, 'console_log.json')
+self.log_data = []
+self.MAX_LOG_ENTRIES = 1000
 
-    def write(self, message):
-        self.terminal.write(message)
-        if message.strip():  # Only log non-empty messages
-            log_entry = {
-                'timestamp': datetime.now().isoformat(),
-                'message': message.strip()
-            }
-            # Add new entry at the beginning of the list
-            self.log_data.insert(0, log_entry)
-            
-            # Keep only the latest MAX_LOG_ENTRIES
-            if len(self.log_data) > self.MAX_LOG_ENTRIES:
-                self.log_data = self.log_data[:self.MAX_LOG_ENTRIES]
-            
-            # Save to file
-            try:
-                with open(self.log_file, 'w', encoding='utf-8') as f:
-                    json.dump(self.log_data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                self.terminal.write(f"\nError saving log: {str(e)}\n")
+# Load existing logs if any
+if os.path.exists(self.log_file):
+try:
+with open(self.log_file, 'r', encoding='utf-8') as f:
+self.log_data = json.load(f)
+# Ensure we only keep the latest MAX_LOG_ENTRIES
+if len(self.log_data) > self.MAX_LOG_ENTRIES:
+self.log_data = self.log_data[-self.MAX_LOG_ENTRIES:]
+except:
+self.log_data = []
 
-    def flush(self):
-        self.terminal.flush()
+def write(self, message):
+self.terminal.write(message)
+if message.strip(): # Only log non-empty messages
+log_entry = {
+'timestamp': datetime.now().isoformat(),
+'message': message.strip()
+}
+# Add new entry at the beginning of the list
+self.log_data.insert(0, log_entry)
+
+# Keep only the latest MAX_LOG_ENTRIES
+if len(self.log_data) > self.MAX_LOG_ENTRIES:
+self.log_data = self.log_data[:self.MAX_LOG_ENTRIES]
+
+# Save to file
+try:
+with open(self.log_file, 'w', encoding='utf-8') as f:
+json.dump(self.log_data, f, ensure_ascii=False, indent=2)
+except Exception as e:
+self.terminal.write(f"\nError saving log: {str(e)}\n")
+
+def flush(self):
+self.terminal.flush()
 
 # def send_telegram_message(bot_token, chat_id, message):
-    # try:
-        # url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        # data = {
-            # "chat_id": chat_id,
-            # "text": message,
-            # "parse_mode": "HTML"
-        # }
-        # response = requests.post(url, json=data)
-        # response.raise_for_status()
-    # except Exception as e:
-        # print(f"Error sending Telegram message: {str(e)}")
+# try:
+# url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+# data = {
+# "chat_id": chat_id,
+# "text": message,
+# "parse_mode": "HTML"
+# }
+# response = requests.post(url, json=data)
+# response.raise_for_status()
+# except Exception as e:
+# print(f"Error sending Telegram message: {str(e)}")
 
 def count_active_workers(log_file):
-    try:
-        with open(log_file, 'r', encoding='utf-8') as f:
-            logs = json.load(f)
-            
-        # Get current time
-        current_time = datetime.now()
-        
-        # Look at logs from the last 5 minutes
-        recent_time = current_time - timedelta(minutes=5)
-        
-        # Get unique active workers from recent logs
-        active_workers = set()
-        error_workers = set()
-        
-        for log in logs:
-            log_time = datetime.fromisoformat(log['timestamp'])
-            if log_time >= recent_time:
-                # Check for worker numbers in messages
-                worker_match = re.search(r'\[Worker (\d+)\]', log['message'])
-                if worker_match:
-                    worker_num = worker_match.group(1)
-                    # Check if the message indicates an error or account blocked
-                    if ('error' in log['message'].lower() or 
-                        'lỗi' in log['message'].lower() or 
-                        'tài khoản bị chặn tạm thời' in log['message'].lower()):
-                        error_workers.add(worker_num)
-                    else:
-                        active_workers.add(worker_num)
-        
-        # Remove error workers from active workers
-        active_workers = active_workers - error_workers
-        
-        return len(active_workers)
-    except Exception as e:
-        print(f"Error counting active workers: {str(e)}")
-        return 0
+try:
+with open(log_file, 'r', encoding='utf-8') as f:
+logs = json.load(f)
+
+# Get current time
+current_time = datetime.now()
+
+# Look at logs from the last 5 minutes
+recent_time = current_time - timedelta(minutes=5)
+
+# Get unique active workers from recent logs
+active_workers = set()
+error_workers = set()
+
+for log in logs:
+log_time = datetime.fromisoformat(log['timestamp'])
+if log_time >= recent_time:
+# Check for worker numbers in messages
+worker_match = re.search(r'\[Worker (\d+)\]', log['message'])
+if worker_match:
+worker_num = worker_match.group(1)
+# Check if the message indicates an error or account blocked
+if ('error' in log['message'].lower() or
+'lỗi' in log['message'].lower() or
+'tài khoản bị chặn tạm thời' in log['message'].lower()):
+error_workers.add(worker_num)
+else:
+active_workers.add(worker_num)
+
+# Remove error workers from active workers
+active_workers = active_workers - error_workers
+
+return len(active_workers)
+except Exception as e:
+print(f"Error counting active workers: {str(e)}")
+return 0
 
 # def monitor_workers(output_dir, bot_token, chat_id):
-    # log_file = os.path.join(output_dir, 'console_log.json')
-    
-    # Wait for initial delay (1 minute)
-    # time.sleep(60)
-    
-    # while True:
-        # try:
-            # active_count = count_active_workers(log_file)
-            # current_time = datetime.now().strftime("%b %d")
-            # message = f"May 15: Hiện tại đang có {active_count} Worker làm việc"
-            # send_telegram_message(bot_token, chat_id, message)
-            
-            # Wait for 2H before next check
-            # time.sleep(7200)
-        # except Exception as e:
-            # print(f"Error in monitor_workers: {str(e)}")
-            # time.sleep(60)  # Wait 1 minute before retrying if there's an error
+# log_file = os.path.join(output_dir, 'console_log.json')
+
+# Wait for initial delay (1 minute)
+# time.sleep(60)
+
+# while True:
+# try:
+# active_count = count_active_workers(log_file)
+# current_time = datetime.now().strftime("%b %d")
+# message = f"May 15: Hiện tại đang có {active_count} Worker làm việc"
+# send_telegram_message(bot_token, chat_id, message)
+
+# Wait for 2H before next check
+# time.sleep(7200)
+# except Exception as e:
+# print(f"Error in monitor_workers: {str(e)}")
+# time.sleep(60) # Wait 1 minute before retrying if there's an error
 
 # Hàm để giám sát và khởi động lại Chrome instances nếu bị đơ
 def chrome_activity_monitor(active_chrome_instances, lock, available_chrome_commands, keywords, processed_items, processed_groups, output_dir):
-    while True:
-        time.sleep(60)  # Kiểm tra mỗi phút
-        inactive_instances = []
-        
-        with lock:
-            for worker_id, chrome_instance in list(active_chrome_instances.items()):
-                if chrome_instance.is_inactive():
-                    print(f"[Monitor] Chrome instance {worker_id} không hoạt động quá 5 phút, sẽ được thay thế")
-                    inactive_instances.append(worker_id)
-                    
-            # Khởi động Chrome instances mới để thay thế các instance không hoạt động
-            for worker_id in inactive_instances:
-                chrome_instance = active_chrome_instances[worker_id]
-                chrome_instance.kill_chrome()
-                del active_chrome_instances[worker_id]
-                
-                # Kiểm tra xem có lệnh chrome nào khả dụng không
-                if available_chrome_commands:
-                    new_command = available_chrome_commands.pop(0)
-                    new_port_match = re.search(r'--remote-debugging-port=(\d+)', new_command)
-                    if new_port_match:
-                        new_port = int(new_port_match.group(1))
-                        new_worker_id = new_port - 9222 + 1
-                        print(f"[Monitor] Khởi động worker mới với port {new_port} (Worker ID: {new_worker_id}) để thay thế worker {worker_id}")
-                        
-                        new_chrome = ChromeInstance(debug_port=new_port, worker_id=new_worker_id, chrome_command=new_command)
-                        new_thread = threading.Thread(
-                            target=worker_process,
-                            args=(new_chrome, keywords, processed_items, processed_groups, lock, output_dir, available_chrome_commands, active_chrome_instances)
-                        )
-                        new_thread.daemon = True
-                        new_thread.start()
+max_instances = 10 # Số lượng Chrome instances tối đa cần duy trì
+
+while True:
+time.sleep(60) # Kiểm tra mỗi phút
+
+with lock:
+# Đếm số lượng Chrome instances đang hoạt động
+current_active_count = len(active_chrome_instances)
+print(f"[Monitor] Hiện có {current_active_count} Chrome instances đang hoạt động")
+
+# Kiểm tra xem có Chrome instance nào đã không hoạt động
+inactive_instances = []
+checkpoint_instances = []
+
+for worker_id, chrome_instance in list(active_chrome_instances.items()):
+# Bỏ qua các instance đang thu thập URL
+if hasattr(chrome_instance, 'is_collecting_urls') and chrome_instance.is_collecting_urls:
+print(f"[Monitor] Chrome instance {worker_id} đang thu thập URLs, bỏ qua kiểm tra")
+continue
+
+# Kiểm tra timeout
+try:
+if hasattr(chrome_instance, 'driver') and chrome_instance.driver:
+try:
+chrome_instance.driver.execute_script("return navigator.userAgent")
+except Exception as e:
+error_message = str(e).lower()
+if any(keyword in error_message for keyword in ["timeout", "timed out", "no such window", "out of memory"]):
+print(f"[Monitor] Chrome instance {worker_id} bị lỗi timeout/out of memory, sẽ được thay thế")
+inactive_instances.append(worker_id)
+continue
+except Exception as e:
+print(f"[Monitor] Lỗi khi kiểm tra timeout cho instance {worker_id}: {str(e)}")
+
+# Kiểm tra hoạt động
+if chrome_instance.is_inactive():
+print(f"[Monitor] Chrome instance {worker_id} không hoạt động quá 5 phút, sẽ được thay thế")
+inactive_instances.append(worker_id)
+elif chrome_instance.is_checkpoint or chrome_instance.is_blocked:
+print(f"[Monitor] Chrome instance {worker_id} bị checkpoint hoặc bị chặn, sẽ được thay thế")
+checkpoint_instances.append(worker_id)
+if chrome_instance.chrome_command:
+available_chrome_commands.append(chrome_instance.chrome_command)
+print(f"[Monitor] Đưa lệnh chrome của worker {worker_id} trở lại hàng đợi để thử lại sau")
+
+# Xử lý các instance không hoạt động
+for worker_id in inactive_instances:
+if worker_id in active_chrome_instances: # Kiểm tra lại để đảm bảo an toàn
+chrome_instance = active_chrome_instances[worker_id]
+if chrome_instance.chrome_command:
+available_chrome_commands.append(chrome_instance.chrome_command)
+print(f"[Monitor] Đưa lệnh chrome của worker {worker_id} trở lại hàng đợi để thử lại sau")
+chrome_instance.kill_chrome()
+del active_chrome_instances[worker_id]
+
+# Xử lý các instance bị checkpoint
+for worker_id in checkpoint_instances:
+if worker_id in active_chrome_instances: # Kiểm tra lại để đảm bảo an toàn
+chrome_instance = active_chrome_instances[worker_id]
+chrome_instance.kill_chrome()
+del active_chrome_instances[worker_id]
+
+# Cập nhật lại số lượng Chrome đang hoạt động
+current_active_count = len(active_chrome_instances)
+
+# Chỉ thêm instance mới nếu số lượng hiện tại ít hơn max_instances
+instances_to_add = max_instances - current_active_count
+
+if instances_to_add > 0:
+print(f"[Monitor] Cần thêm {instances_to_add} Chrome instances để đạt đủ {max_instances}")
+
+# Thêm các instance mới nếu cần và có lệnh chrome khả dụng
+for _ in range(instances_to_add):
+# Kiểm tra lại số lượng hiện tại để đảm bảo không vượt quá max_instances
+if len(active_chrome_instances) >= max_instances:
+print(f"[Monitor] Đã đạt đủ {max_instances} Chrome instances, dừng thêm mới")
+break
+
+# Nếu không còn lệnh Chrome khả dụng, tải lại từ file
+if not available_chrome_commands:
+print("[Monitor] Hết lệnh Chrome trong hàng đợi, tải lại từ file chrome_commands.txt")
+try:
+chrome_commands_file = r'C:\Users\Admin-DL\Downloads\chrome_commands.txt'
+new_commands = load_chrome_commands(chrome_commands_file)
+if new_commands:
+available_chrome_commands.extend(new_commands)
+print(f"[Monitor] Đã tải lại {len(new_commands)} lệnh Chrome từ file")
+else:
+print("[Monitor] Không tìm thấy lệnh Chrome mới trong file")
+break
+except Exception as e:
+print(f"[Monitor] Lỗi khi tải lại lệnh Chrome: {str(e)}")
+break
+
+if available_chrome_commands:
+new_command = available_chrome_commands.pop(0)
+new_port_match = re.search(r'--remote-debugging-port=(\d+)', new_command)
+if new_port_match:
+new_port = int(new_port_match.group(1))
+new_worker_id = new_port - 9222 + 1
+
+# Kiểm tra xem worker_id này đã tồn tại trong active_chrome_instances chưa
+if new_worker_id in active_chrome_instances:
+print(f"[Monitor] Worker ID {new_worker_id} đã tồn tại, bỏ qua")
+available_chrome_commands.append(new_command) # Đưa lệnh trở lại hàng đợi
+continue
+
+print(f"[Monitor] Khởi động worker mới với port {new_port} (Worker ID: {new_worker_id})")
+
+new_chrome = ChromeInstance(debug_port=new_port, worker_id=new_worker_id, chrome_command=new_command)
+# Thêm vào active_chrome_instances trước khi khởi động thread để tránh trùng lặp
+active_chrome_instances[new_worker_id] = new_chrome
+
+new_thread = threading.Thread(
+target=worker_process,
+args=(new_chrome, keywords, processed_items, processed_groups, lock, output_dir, available_chrome_commands, active_chrome_instances)
+)
+new_thread.daemon = True
+new_thread.start()
+
+time.sleep(5) # Tăng delay giữa các lần khởi động Chrome để tránh quá tải
 
 def main():
-    input_file = r'C:\Users\Admin-DL\Downloads\Tìm Group Công Khai\Keyword.txt'
-    output_dir = r'C:\Users\Admin-DL\Downloads\Tìm Group Công Khai\output'
-    chrome_commands_file = r'C:\Users\Admin-DL\Downloads\chrome_commands.txt'
+input_file = r'C:\Users\Admin-DL\Downloads\Tìm Group Công Khai\Keyword.txt'
+output_dir = r'C:\Users\Admin-DL\Downloads\Tìm Group Công Khai\output'
+chrome_commands_file = r'C:\Users\Admin-DL\Downloads\chrome_commands.txt'
 
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Add this line to capture all console output
-    sys.stdout = OutputLogger(output_dir)
+os.makedirs(output_dir, exist_ok=True)
 
-    # Load Chrome commands from file
-    chrome_commands = load_chrome_commands(chrome_commands_file)
-    if not chrome_commands:
-        print("Không tìm thấy file chrome_commands.txt hoặc file rỗng")
-        return
-    
-    print(f"Đã tải {len(chrome_commands)} lệnh Chrome từ file")
-    
-    keywords = load_keywords(input_file)
-    processed_items, processed_groups = load_progress(output_dir)
-    processed_items = set(processed_items)
+# Add this line to capture all console output
+sys.stdout = OutputLogger(output_dir)
 
-    total_keywords = len(keywords)
-    total_combinations = get_combinations_count(total_keywords)
-    used_combinations = len(processed_items)
+# Load Chrome commands from file
+chrome_commands = load_chrome_commands(chrome_commands_file)
+if not chrome_commands:
+print("Không tìm thấy file chrome_commands.txt hoặc file rỗng")
+return
 
-    print(f"Tổng số keywords gốc: {total_keywords}")
-    print(f"Tổng số tổ hợp có thể: {total_combinations}")
-    print(f"Số tổ hợp đã sử dụng: {used_combinations}")
-    print(f"Còn lại: {total_combinations - used_combinations} tổ hợp chưa sử dụng")
+print(f"Đã tải {len(chrome_commands)} lệnh Chrome từ file")
 
-    # Khởi tạo các biến dùng chung
-    lock = threading.Lock()
-    active_chrome_instances = {}  # Dictionary để theo dõi các Chrome instances đang hoạt động
-    available_chrome_commands = chrome_commands.copy()  # Sao chép danh sách lệnh để tránh thay đổi gốc
-    
-    # Số lượng Chrome instances chạy cùng lúc (ban đầu là 10)
-    max_concurrent_instances = min(10, len(chrome_commands))
-    
-    # Khởi động thread giám sát hoạt động của các Chrome instances
-    monitor_thread = threading.Thread(
-        target=chrome_activity_monitor,
-        args=(active_chrome_instances, lock, available_chrome_commands, keywords, processed_items, processed_groups, output_dir)
-    )
-    monitor_thread.daemon = True
-    monitor_thread.start()
+keywords = load_keywords(input_file)
+processed_items, processed_groups = load_progress(output_dir)
+processed_items = set(processed_items)
 
-    # Khởi động các Chrome instances đầu tiên
-    threads = []
-    for i in range(max_concurrent_instances):
-        if i < len(available_chrome_commands):
-            command = available_chrome_commands.pop(0)
-            port_match = re.search(r'--remote-debugging-port=(\d+)', command)
-            if port_match:
-                port = int(port_match.group(1))
-                worker_id = port - 9222 + 1
-                
-                chrome_instance = ChromeInstance(debug_port=port, worker_id=worker_id, chrome_command=command)
-                thread = threading.Thread(
-                    target=worker_process,
-                    args=(chrome_instance, keywords, processed_items, processed_groups, lock, output_dir, available_chrome_commands, active_chrome_instances)
-                )
-                threads.append(thread)
-                thread.start()
-                print(f"Đã khởi động Worker {worker_id} với port {port}")
-                time.sleep(2)  # Delay giữa các lần khởi động Chrome để tránh quá tải
+total_keywords = len(keywords)
+total_combinations = get_combinations_count(total_keywords)
+used_combinations = len(processed_items)
 
-    # Chờ tất cả các threads kết thúc
-    for thread in threads:
-        thread.join()
+print(f"Tổng số keywords gốc: {total_keywords}")
+print(f"Tổng số tổ hợp có thể: {total_combinations}")
+print(f"Số tổ hợp đã sử dụng: {used_combinations}")
+print(f"Còn lại: {total_combinations - used_combinations} tổ hợp chưa sử dụng")
 
-    print("\nHoàn tất xử lý!")
+# Khởi tạo các biến dùng chung
+lock = threading.Lock()
+active_chrome_instances = {} # Dictionary để theo dõi các Chrome instances đang hoạt động
+available_chrome_commands = chrome_commands.copy() # Sao chép danh sách lệnh để tránh thay đổi gốc
+
+# Số lượng Chrome instances chạy cùng lúc (ban đầu là 10)
+max_concurrent_instances = min(10, len(chrome_commands))
+
+# Khởi động thread giám sát hoạt động của các Chrome instances
+monitor_thread = threading.Thread(
+target=chrome_activity_monitor,
+args=(active_chrome_instances, lock, available_chrome_commands, keywords, processed_items, processed_groups, output_dir)
+)
+monitor_thread.daemon = True
+monitor_thread.start()
+
+# Khởi động các Chrome instances đầu tiên
+threads = []
+with lock: # Thêm lock ở đây để đảm bảo đồng bộ
+for i in range(max_concurrent_instances):
+if i < len(available_chrome_commands):
+command = available_chrome_commands.pop(0)
+port_match = re.search(r'--remote-debugging-port=(\d+)', command)
+if port_match:
+port = int(port_match.group(1))
+worker_id = port - 9222 + 1
+
+# Kiểm tra worker_id đã tồn tại chưa
+if worker_id in active_chrome_instances:
+print(f"Worker ID {worker_id} đã tồn tại, bỏ qua")
+available_chrome_commands.append(command) # Đưa lệnh trở lại hàng đợi
+continue
+
+chrome_instance = ChromeInstance(debug_port=port, worker_id=worker_id, chrome_command=command)
+# Thêm vào active_chrome_instances trước khi khởi động thread
+active_chrome_instances[worker_id] = chrome_instance
+
+thread = threading.Thread(
+target=worker_process,
+args=(chrome_instance, keywords, processed_items, processed_groups, lock, output_dir, available_chrome_commands, active_chrome_instances)
+)
+threads.append(thread)
+thread.start()
+print(f"Đã khởi động Worker {worker_id} với port {port}")
+time.sleep(2) # Delay giữa các lần khởi động Chrome để tránh quá tải
+
+# Chờ tất cả các threads kết thúc
+for thread in threads:
+thread.join()
+
+print("\nHoàn tất xử lý!")
 
 if __name__ == "__main__":
-    main()
+main()
